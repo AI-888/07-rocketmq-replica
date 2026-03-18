@@ -4,25 +4,25 @@
 
 本组件是一个独立的 Java 程序，用于模拟 RocketMQ Slave Broker 的主从复制行为，从存储层角度实现数据同步。该组件通过 NameServer 发现当前集群的 Master Broker，伪装成 Slave 节点，使用 RocketMQ 原生的 HA 复制协议（DefaultHAService 协议）与 Master 建立 TCP 连接，持续拉取 CommitLog 数据并写入目标 RocketMQ 集群。
 
-**架构设计（Source 单节点 + Sink 分布式）：**
+**架构设计（Source 无状态多实例 + Sink 分布式）：**
 
 本组件采用类似 **Flink Connector** 的 Source/Sink 分离架构：
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│                      Source Worker（单节点）                          │
+│                      Source Worker（无状态，可多实例）                 │
 │                                                                      │
 │  ┌──────────────────┐   ZMQ REP Socket   ┌──────────────────────┐   │
 │  │   HASource        │ ◄─── REQ-REP ───► │  Sink（分布式多节点）  │  │
-│  │  (单节点，拉取)   │   PullReq/Resp    │  (写入目标 RocketMQ)  │  │
+│  │  (无状态，拉取)   │   PullReq/Resp    │  (写入目标 RocketMQ)  │  │
 │  └──────────────────┘                     └──────────────────────┘  │
 │           │                                          │               │
 │    CheckpointCoordinator（位点协调器）◄───────────────┘               │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-- **HASource（单节点）**：负责连接 Master、接收 CommitLog 数据、解析消息，统计每个 Topic 的消息字节数，将解析后的 `SyncRecord` 暂存于本地内存缓冲区，通过 ZMQ REP Socket 向 Sink 提供数据；Source 只在一个节点上运行，节点故障后在其他节点重启
-- **Sink（分布式）**：通过 ZMQ REQ Socket 从 Source 拉取数据，按 Source 统计的各 Topic 流量，将消息均匀写入目标 RocketMQ 集群；多个 Sink 节点并行工作
+- **HASource**：负责连接 Master、接收 CommitLog 数据、解析消息，统计每个 Topic 的消息字节数，将解析后的 `SyncRecord` 暂存于本地内存缓冲区，通过 ZMQ REP Socket 向 Sink 提供数据；Source 本身无状态，故障后由外部工具自动拉起，从 Checkpoint 断点续传。可能存在多个 Source，每个 Source 将自身信息写入源集群 NameServer 的独立唯一 KV 中
+- **Sink（分布式）**：通过 ZMQ REQ Socket 从 Source 拉取数据，Source 将流量分发给已注册的 Sink 列表；多个 Sink 节点并行工作
 - **SyncRecord**：Source 与 Sink 之间传递的数据单元，包含消息内容、偏移量、Topic、字节数等元信息
 - **CheckpointCoordinator**：协调 Source 与 Sink 的位点，仅在 Sink 确认写入落盘后才推进 `confirmedOffset`
 
@@ -32,7 +32,7 @@
 - Source/Sink 解耦，Source 专注数据拉取与流量统计，Sink 专注数据写入，可独立扩展
 - **统一 ZMQ 通信模型**：Source 和 Sink **始终**通过 ZeroMQ（REQ-REP 模式）通信，无论是独立部署还是同进程启动，通信协议和服务发现逻辑完全一致，减少维护差异
 - **灵活部署模式**：Source 和 Sink 可作为独立 Worker 进程运行（独立部署），也可通过 `--with-sink` 参数让 Source 在同一进程内嵌启动 Sink（同进程模式），两种模式下 Sink 均通过 ZMQ 从 Source 拉取数据
-- **Source 地址注册**：Source 启动后将自身 ZMQ 地址注册到目标集群 NameServer 的 KV 存储中，Sink 通过目标集群 NameServer KV 自动发现 Source 地址
+- **Source 地址注册**：每个 Source 启动后将自身 ZMQ 地址注册到源集群 NameServer 的独立唯一 KV 中（key 为 `{sourceNodeId}`），支持多个 Source 同时存在；Sink 通过源集群 NameServer KV 自动发现可用 Source 列表
 - **完全无状态设计**：Checkpoint 等状态信息存储在目标集群 NameServer KV 中，Source 和 Sink 均无本地状态，可随意迁移和替换
 - 通过 NameServer 动态发现 Master Broker 的 HA 地址，Master 切换后自动重连
 - 不参与主从切换选举，仅作为只读数据复制节点
@@ -54,7 +54,7 @@
 | 阶段三：Checkpoint + 最终一致性 | 需求 9~10 | 位点持久化、最终一致性语义 + 启动一致性校验 |
 | 阶段四：Sink 核心 | 需求 11~13 | Topic 过滤、元数据同步、RFQ 副本失败队列 |
 | 阶段五：可靠性增强 | 需求 14~17 | 异常处理、自动重试、目标不可写监控、优雅停机 |
-| 阶段六：分布式 & 高性能 | 需求 18~19 | Source 单节点 + Sink 分布式、全链路 Trace + 高 TPS |
+| 阶段六：分布式 & 高性能 | 需求 18~19 | Source 多实例 + Sink 分布式、全链路 Trace + 高 TPS |
 | 阶段七：可观测性 | 需求 20 | 监控指标 |
 
 ---
@@ -78,7 +78,7 @@
    | 参数 | 说明 |
    |------|------|
    | `--sourceNamesrv <addr>` | 源集群 NameServer 地址，多个地址以 `;` 分隔 |
-   | `--targetNamesrv <addr>` | 目标集群 NameServer 地址（用于注册 ZMQ 地址、写入 Checkpoint 等） |
+   | `--targetNamesrv <addr>` | 目标集群 NameServer 地址（用于写入 Checkpoint 等） |
 
 2. WHEN 启动 Source 组件时 THEN 系统 SHALL 支持以下**可选**启动参数：
 
@@ -208,7 +208,7 @@
    - 使用 DefaultHAService Slave 协议与 Master 建立 TCP 连接
    - 持续接收并解析 CommitLog 数据包，将每条消息封装为 `SyncRecord` 暂存于本地内存缓冲区
    - 通过 ZMQ REP Socket 响应 Sink 的 PullRequest，按需返回缓冲区中的 SyncRecord
-   - 统计每个 Topic 的消息字节数（`topicBytesStats`），供 Sink 侧流量均衡使用
+   - 统计每个 Topic 的消息字节数（`topicBytesStats`），供监控使用
    - 处理 Master 宕机、网络闪断等异常，自动重连
    - **不执行 Topic 过滤和存储写入**，这些职责属于 Sink
 
@@ -236,12 +236,12 @@
 **Source 与 Sink 独立部署（ZeroMQ 通信 + NameServer KV 服务发现）：**
 
 7. WHEN Source 启动时 THEN 系统 SHALL 在指定端口（`--zmqBindPort`，默认 5555）启动 ZeroMQ REP Socket，等待 Sink 的 Pull 请求；Source 将解析后的 `SyncRecord` 暂存于本地内存缓冲区，Sink 通过 ZMQ REQ-REP 模式主动拉取
-8. WHEN Source 启动成功后 THEN 系统 SHALL 将自身 ZMQ 地址注册到**目标集群 NameServer** 的 KV 存储中（namespace: `SYNC_SOURCE_CONFIG`，key: `{brokerName}`，value: `{host}:{zmqPort}:{timestamp}`），并定期刷新（默认每 30 秒），确保 Sink 能通过目标集群 NameServer KV 自动发现 Source 地址
-9. WHEN Sink 启动时 THEN 系统 SHALL 通过目标集群 NameServer 的 KV 接口（`GET_KV_CONFIG`，namespace: `SYNC_SOURCE_CONFIG`，key: `{brokerName}`）查询 Source 的 ZMQ 地址，并通过 ZMQ REQ Socket 连接 Source 拉取数据
+8. WHEN Source 启动成功后 THEN 系统 SHALL 将自身 ZMQ 地址注册到**源集群 NameServer** 的 KV 存储中（namespace: `SYNC_SOURCE_CONFIG`，key: `{sourceNodeId}`，value: `{host}:{zmqPort}:{timestamp}`），并定期刷新（默认每 30 秒）；每个 Source 使用自身的 `sourceNodeId` 作为唯一 key，支持多个 Source 同时存在，Sink 通过遍历 `SYNC_SOURCE_CONFIG` namespace 下的所有 key 发现所有可用 Source 地址
+9. WHEN Sink 启动时 THEN 系统 SHALL 通过源集群 NameServer 的 KV 接口（`GET_KV_LIST_BY_NAMESPACE`，namespace: `SYNC_SOURCE_CONFIG`）查询所有 Source 的 ZMQ 地址列表，并选择可用的 Source 通过 ZMQ REQ Socket 连接拉取数据
 10. WHEN Sink 拉取数据时 THEN 系统 SHALL 通过 ZMQ REQ 发送 `PullRequest`（包含 `topicFilter`、`fromOffset`、`batchSize`），Source 通过 ZMQ REP 返回 `PullResponse`（包含 `records[]`、`maxOffset`）
 11. WHEN Sink 成功将数据写入目标集群后 THEN 系统 SHALL 将自身的 `commitOffset` 写入**目标集群 NameServer** 的 KV 存储中（namespace: `SYNC_CHECKPOINT`，key: `{brokerName}:sink:{sinkId}:commitOffset`），Source 定期读取所有 Sink 的 commitOffset，取 `min` 值作为 `globalCheckpoint` 并写入 KV（key: `{brokerName}:globalCheckpoint`）
 12. WHEN Source 或 Sink 重启时 THEN 系统 SHALL 从目标集群 NameServer KV 中读取 `globalCheckpoint`（Source）或自身的 `commitOffset`（Sink）恢复状态，实现**完全无状态**设计
-13. WHEN Source 优雅关闭时 THEN 系统 SHALL 从目标集群 NameServer KV 中删除自身的注册信息（`DELETE_KV_CONFIG`）
+13. WHEN Source 优雅关闭时 THEN 系统 SHALL 从源集群 NameServer KV 中删除自身的注册信息（`DELETE_KV_CONFIG`，key: `{sourceNodeId}`）
 
 ---
 
@@ -631,28 +631,30 @@
 
 ## 阶段六：分布式 & 高性能
 
-### 需求 18：分布式负载均衡
+### 需求 18：Source 多实例注册与 Sink 分布式消费
 
-**用户故事：** 作为一名数据同步组件，我希望 Source 任务只在一个节点上运行，节点故障后在其他节点重启；Sink 任务是分布式的，按 Source 统计的各 Topic 流量将消息均匀写入目标 RocketMQ 集群，以便实现高吞吐的数据同步。
+**用户故事：** 作为一名数据同步组件，我希望 Source 是无状态的，可以存在多个实例，每个 Source 将自身信息注册到源集群 NameServer 的独立唯一 KV 中；Source 故障后由外部工具自动拉起。Sink 是分布式的，Source 将流量分发给已注册的 Sink 列表，以便实现高吞吐的数据同步。
 
 #### 验收标准
 
-**Source 单节点运行：**
+**Source 无状态多实例：**
 
-1. WHEN Source 节点启动时 THEN 系统 SHALL 通过分布式锁（基于 ZooKeeper 或 Redis，可配置）确保同一时刻只有一个 Source 节点处于活跃状态
-2. WHEN 活跃 Source 节点发生故障时 THEN 系统 SHALL 支持在其他节点重新启动 Source 任务，新节点从 Checkpoint 的 `confirmedOffset` 断点续传
-3. WHEN Source 节点启动时 THEN 系统 SHALL 在启动日志中打印当前节点标识（`nodeId`，可通过 `--nodeId` 参数指定，默认为 `hostname:pid`）
+1. WHEN Source 节点启动时 THEN 系统 SHALL 将自身信息注册到**源集群 NameServer** 的 KV 存储中（namespace: `SYNC_SOURCE_CONFIG`，key: `{sourceNodeId}`，value: `{host}:{zmqPort}:{timestamp}`），`sourceNodeId` 是该 Source 实例的唯一标识（可通过 `--sourceNodeId` 参数指定，默认为 `hostname:pid`）
+2. WHEN 多个 Source 实例同时运行时 THEN 系统 SHALL 允许每个 Source 独立注册自己的 KV，互不冲突；每个 Source 使用自身唯一的 `sourceNodeId` 作为 key
+3. WHEN Source 节点故障时 THEN 系统 SHALL 由外部运维工具（如 K8s、Supervisor 等）负责自动拉起，新实例从 Checkpoint 的 `confirmedOffset` 断点续传
+4. WHEN Source 节点启动时 THEN 系统 SHALL 在启动日志中打印当前节点标识（`sourceNodeId`）
+5. WHEN Source 优雅关闭时 THEN 系统 SHALL 从源集群 NameServer KV 中删除自身的注册信息（`DELETE_KV_CONFIG`，key: `{sourceNodeId}`）
 
-**Source 流量统计（供 Sink 负载均衡使用）：**
+**Source 流量统计：**
 
-4. WHEN HASource 解析消息时 THEN 系统 SHALL 统计每个 Topic 的消息字节数（`topicBytesStats: Map<String, Long>`），并将该统计信息附加到 `SyncRecord` 或通过独立的统计快照定期发布
-5. WHEN `topicBytesStats` 更新时 THEN 系统 SHALL 每隔 10 秒将各 Topic 的字节数统计打印到日志（INFO 级别），并通过 `/metrics` 接口暴露
+6. WHEN HASource 解析消息时 THEN 系统 SHALL 统计每个 Topic 的消息字节数（`topicBytesStats: Map<String, Long>`），并将该统计信息附加到 `SyncRecord` 或通过独立的统计快照定期发布
+7. WHEN `topicBytesStats` 更新时 THEN 系统 SHALL 每隔 10 秒将各 Topic 的字节数统计打印到日志（INFO 级别），并通过 `/metrics` 接口暴露
 
-**Sink 分布式负载均衡：**
+**Sink 分布式消费（Source 分发模式）：**
 
-6. WHEN Sink 节点启动时 THEN 系统 SHALL 读取 Source 发布的 `topicBytesStats`，计算各 Topic 的流量占比
-7. WHEN Sink 将消息写入目标 RocketMQ 时 THEN 系统 SHALL 按各 Topic 流量占比，将全部数据**平均**分配到多个 Sink 节点处理，确保各节点负载均衡（偏差不超过 10%）
-8. WHEN Sink 节点数量发生变化时 THEN 系统 SHALL 自动重新计算负载分配，无需重启 Source
+8. WHEN Sink 节点启动时 THEN 系统 SHALL 向 Source 注册自身，Source 维护已注册的 Sink 列表
+9. WHEN Source 收到多个 Sink 的 PullRequest 时 THEN 系统 SHALL 将数据按请求分发给已注册的 Sink 列表，不做负载均衡计算
+10. WHEN Sink 节点数量发生变化（新增或下线）时 THEN 系统 SHALL 自动更新 Sink 列表，无需重启 Source
 
 ---
 

@@ -30,7 +30,7 @@ import java.util.concurrent.atomic.AtomicLong;
  *   <li>持续接收并解析 CommitLog 数据包（需求 7）</li>
  *   <li>统计每个 Topic 的消息字节数</li>
  *   <li>通过 ZMQ REP Socket 向 Sink 提供数据（需求 2 §7）</li>
- *   <li>将 ZMQ 地址注册到目标集群 NameServer KV（需求 2 §8）</li>
+ *   <li>将 ZMQ 地址注册到源集群 NameServer KV（需求 2 §8）</li>
  *   <li>检测 Master 变更并自动重连（需求 8）</li>
  *   <li>将解析失败的消息写入源集群 RFQ Topic（需求 13）</li>
  * </ul>
@@ -115,11 +115,12 @@ public class HASource implements SyncSource {
                 config.getString("sourceNamesrv"),
                 config.getString("brokerName"));
 
-        String targetNamesrv = config.getString("targetNamesrv");
+        String sourceNamesrv = config.getString("sourceNamesrv");
         String zmqHost = getLocalHost();
         int zmqPort = config.getInt("zmqBindPort");
+        String sourceNodeId = config.getSourceNodeId();
 
-        this.registry = new SourceRegistry(targetNamesrv, config.getString("brokerName"),
+        this.registry = new SourceRegistry(sourceNamesrv, sourceNodeId,
                 zmqHost, zmqPort);
 
         this.rfqSink = new RfqSink(
@@ -178,7 +179,7 @@ public class HASource implements SyncSource {
         // 5. CommitLog 过期检测（需求 6）
         checkCommitLogExpiry();
 
-        // 6. 注册到目标集群 NameServer KV（需求 2 §8）
+        // 6. 注册到源集群 NameServer KV（需求 2 §8）
         try {
             registry.register();
         } catch (Exception e) {

@@ -80,11 +80,11 @@ RocketMQ HA 数据同步组件是一个**独立的 Java 程序**，模拟 Rocket
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
-│                      Source Worker（单节点）                            │
+│                  Source Worker（无状态，可多实例）                       │
 │                                                                        │
 │  ┌───────────────────┐   ZMQ REP Socket      ┌────────────────────┐   │
 │  │    HASource        │ ◄─── REQ-REP ─────►  │ Sink（分布式多节点）│   │
-│  │   (单节点拉取)     │   PullReq/PullResp   │ (写入目标 RocketMQ) │   │
+│  │  (无状态，可多实例)│   PullReq/PullResp   │ (写入目标 RocketMQ) │   │
 │  │                    │                       │                    │   │
 │  └───────────────────┘                        └────────────────────┘   │
 │          │                                               │             │
@@ -103,8 +103,12 @@ RocketMQ HA 数据同步组件是一个**独立的 Java 程序**，模拟 Rocket
                     └───────────────────────────┘
 
                     ┌───────────────────────────┐
-                    │  目标集群 NameServer KV    │
+                    │  源集群 NameServer KV      │
                     │  - Source 地址注册         │
+                    └───────────────────────────┘
+
+                    ┌───────────────────────────┐
+                    │  目标集群 NameServer KV    │
                     │  - Checkpoint 存储         │
                     └─────────────┬─────────────┘
                                   │
@@ -127,7 +131,7 @@ RocketMQ HA 数据同步组件是一个**独立的 Java 程序**，模拟 Rocket
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│                       Source Worker（单节点）                     │
+│                  Source Worker（无状态，可多实例）                 │
 │                                                                  │
 │  ┌──────────────┐   ┌──────────────┐   ┌───────────────────┐   │
 │  │ HA Connection│──►│ CommitLog    │──►│ ZeroMQ REP        │   │
@@ -135,7 +139,7 @@ RocketMQ HA 数据同步组件是一个**独立的 Java 程序**，模拟 Rocket
 │  └──────────────┘   └──────────────┘   └───────────────────┘   │
 │         │                  │                       │            │
 │         │           topicBytesStats                 │            │
-│         └──► NameServer KV 注册 ZMQ 地址 ◄─────────┘            │
+│         └──► 源集群 NameServer KV 注册 ZMQ 地址 ◄──────────┘            │
 │                                                                  │
 │  ┌──────────────┐   ┌──────────────┐                            │
 │  │ RFQ Sink     │   │ MetadataSync │                            │
@@ -166,20 +170,22 @@ RocketMQ HA 数据同步组件是一个**独立的 Java 程序**，模拟 Rocket
 
 ┌──────────────────────────────────────────────────────────────────┐
 │                       Sink Worker 2 ... N                        │
-│  (多个 Sink 并行写入，按 Topic 流量负载均衡)                      │
+│  (多个 Sink 并行写入，Source 按 PullRequest 分发数据)             │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
 ### 2.3 NameServer KV 数据模型
 
 > **对应需求**：需求 2 §8、§11（Source 地址注册、Checkpoint 存储）
+> 
+> **注意**：Source 地址注册在**源集群** NameServer KV 中，每个 Source 实例使用自身唯一的 `sourceNodeId` 作为 key，支持多个 Source 实例同时注册。
 
 ```
-Namespace: SYNC_SOURCE_CONFIG
-├── Key: {brokerName}
+Namespace: SYNC_SOURCE_CONFIG（存储在源集群 NameServer）
+├── Key: {sourceNodeId}                          // 每个 Source 实例的唯一标识
 └── Value: {host}:{zmqPort}:{timestamp}          // Source ZMQ 地址
 
-Namespace: SYNC_CHECKPOINT
+Namespace: SYNC_CHECKPOINT（存储在目标集群 NameServer）
 ├── Key: {brokerName}:globalCheckpoint
 │   └── Value: {minOffset}                       // 所有 Sink 的最小 commitOffset
 ├── Key: {brokerName}:sink:{sinkId}:commitOffset
@@ -535,7 +541,7 @@ public class SourceBootstrap {
 
 无论 Sink 是独立部署还是内嵌在 Source 进程中，均执行以下流程：
 
-1. 从目标集群 NameServer KV 发现 Source ZMQ 地址
+1. 从源集群 NameServer KV 发现 Source ZMQ 地址
 2. 通过 ZMQ REQ Socket 连接 Source
 3. 发送 PullRequest（含 fromOffset、topicFilter、batchSize、sinkId）
 4. 接收 PullResponse（含 records[]、maxOffset、status）
@@ -555,7 +561,7 @@ public class SourceBootstrap {
 | CommitLog 解析 | 解析消息并封装为 SyncRecord | 需求 7 |
 | Topic 流量统计 | 统计每个 Topic 的消息字节数 | 需求 18 |
 | ZMQ 数据服务 | 通过 ZMQ REP Socket 向 Sink 提供数据 | 需求 2 §7 |
-| 地址注册 | 将 ZMQ 地址注册到目标集群 NameServer KV | 需求 2 §8 |
+| 地址注册 | 将 ZMQ 地址注册到源集群 NameServer KV | 需求 2 §8 |
 | Master 切换 | 检测 Master 变更并自动重连 | 需求 8 |
 | RFQ 处理 | 将解析失败的消息写入源集群 RFQ Topic | 需求 13 |
 | **不执行** | Topic 过滤、存储写入（属于 Sink 职责） | 需求 2 §3 |
@@ -591,9 +597,9 @@ public class HASource implements SyncSource {
         zmqSocket = zmqContext.socket(ZMQ.REP);
         zmqSocket.bind("tcp://0.0.0.0:" + config.getZmqBindPort());
         
-        // 4. 注册到目标集群 NameServer KV
+        // 4. 注册到源集群 NameServer KV（每个 Source 实例独立注册）
         //    → namespace: SYNC_SOURCE_CONFIG
-        //    → key: {brokerName}
+        //    → key: {sourceNodeId}（当前 Source 的唯一标识）
         //    → value: {host}:{zmqPort}:{timestamp}
         registry.register();
         
@@ -671,7 +677,7 @@ public class HASource implements SyncSource {
         zmqContext.close();
         // 3. 关闭 RFQ Sink
         rfqSink.stop();
-        // 4. 从 NameServer KV 删除注册（DELETE_KV_CONFIG）
+        // 4. 从源集群 NameServer KV 删除注册（DELETE_KV_CONFIG，key: {sourceNodeId}）
         registry.unregister();
     }
 }
@@ -742,8 +748,8 @@ public class RocketMQSink implements SyncSink {
     
     @Override
     public void start() throws Exception {
-        // 1. 从目标集群 NameServer KV 查询 Source ZMQ 地址
-        //    → GET_KV_CONFIG(SYNC_SOURCE_CONFIG, {brokerName})
+        // 1. 从源集群 NameServer KV 查询 Source ZMQ 地址列表
+        //    → GET_KV_LIST(SYNC_SOURCE_CONFIG)，遍历所有已注册的 Source
         String sourceAddr = discoverSourceAddr();
         
         // 2. 连接 Source 的 ZMQ REP Socket
@@ -1350,9 +1356,9 @@ public class RfqSink {
 
  7. 启动 ZMQ REP Socket（绑定 --zmqBindPort，默认 5555）
 
- 8. 注册到目标集群 NameServer KV（需求 2 §8）
+ 8. 注册到源集群 NameServer KV（每个 Source 实例独立注册，需求 2 §8）
     └─ Namespace: SYNC_SOURCE_CONFIG
-        Key: {brokerName}
+        Key: {sourceNodeId}
         Value: {host}:{zmqPort}:{timestamp}
 
  9. 初始化 RFQ Sink（复用 sourceNamesrv 连接）
@@ -1386,8 +1392,8 @@ public class RfqSink {
  1. 加载配置（环境变量 > CLI > 配置文件 > 默认值）
     └─ SinkConfig.load()，打印最终生效配置及来源
 
- 2. 从目标集群 NameServer KV 查询 Source ZMQ 地址（需求 2 §9）
-    └─ GET_KV_CONFIG(SYNC_SOURCE_CONFIG, {brokerName})
+ 2. 从源集群 NameServer KV 查询 Source ZMQ 地址列表（需求 2 §9）
+    └─ GET_KV_LIST(SYNC_SOURCE_CONFIG)，遍历所有已注册的 Source 实例
 
  3. 连接 Source 的 ZMQ REP Socket（ZMQ REQ）
 
@@ -1612,7 +1618,7 @@ Source                                              Sink
 
 7. 关闭 ZMQ Socket
 
-8. Source: 从 NameServer KV 删除注册（DELETE_KV_CONFIG）（需求 2 §13）
+8. Source: 从源集群 NameServer KV 删除注册（DELETE_KV_CONFIG）（需求 2 §13）
 
 9. 关闭 HTTP 监控服务
 
@@ -3048,420 +3054,264 @@ public class ElasticsearchSink implements SyncSink {
 // 无需 SyncPipeline 中转，Sink 扩缩容完全动态
 ```
 
-### 11.3 分布式负载均衡详细设计
+### 11.3 Source 多实例注册与 Sink 分布式消费详细设计
 
-> **对应需求**：需求 18（分布式负载均衡）
+> **对应需求**：需求 18（Source 多实例注册与 Sink 分布式消费）
 
-#### 11.3.1 Source 单节点运行 — 分布式锁设计
+#### 11.3.1 Source 无状态多实例设计
 
-> **对应需求**：需求 18 §1-2
+> **对应需求**：需求 18 §1-5
 
-**设计目标**：确保同一时刻只有一个 Source 节点处于活跃状态，故障后在其他节点自动重启并断点续传。
+**设计目标**：Source 是完全无状态的，可以存在多个实例，每个 Source 将自身信息注册到源集群 NameServer 的独立唯一 KV 中。Source 故障后由外部运维工具（K8s、Supervisor 等）自动拉起，无需分布式锁或备用 Source 机制。
 
-**锁选型**：支持两种分布式锁实现，通过配置项 `--lockProvider` 选择（默认 `nameserver-kv`）：
+**核心原则**：
+- Source 本身无状态，所有持久化状态（Checkpoint 等）存储在目标集群 NameServer KV 中
+- 每个 Source 实例使用 `sourceNodeId` 作为唯一标识，注册到源集群 NameServer KV
+- 故障恢复完全依赖外部工具，新实例从 Checkpoint 断点续传
+- 不需要分布式锁，不需要备用 Source，简化架构
 
-| 锁实现 | 配置值 | 适用场景 | 优点 | 缺点 |
-|--------|--------|---------|------|------|
-| **NameServer KV 锁** | `nameserver-kv` | 默认方案，无额外依赖 | 零依赖，复用已有 NameServer | 非强一致，依赖 TTL 过期 |
-| **ZooKeeper 临时节点锁** | `zookeeper` | 强一致性要求 | 强一致、自动释放 | 需要额外部署 ZooKeeper |
+**Source 注册数据模型（源集群 NameServer KV）**：
 
-**方案一：NameServer KV 锁（默认方案）**
+```
+Namespace: SYNC_SOURCE_CONFIG
+├── Key: {sourceNodeId}                          // 每个 Source 实例的唯一标识
+└── Value: {host}:{zmqPort}:{timestamp}          // Source ZMQ 地址 + 最后注册时间
+```
+
+**Source 注册与注销**：
 
 ```java
 /**
- * 基于 NameServer KV 实现的分布式锁
- * 原理：利用 NameServer KV 的 PUT_KV_CONFIG_UNIQUE 语义（CAS 操作）
- *       + TTL 过期机制实现互斥锁
+ * Source 实例注册器 — 将自身 ZMQ 地址注册到源集群 NameServer KV
+ * 每个 Source 使用自身唯一的 sourceNodeId 作为 key，互不冲突
  */
-public class NameServerKVLock implements DistributedLock {
-    private static final String NAMESPACE = "SYNC_SOURCE_LOCK";
-    private static final long LOCK_TTL_MS = 30_000;      // 锁 TTL 30 秒
-    private static final long RENEW_INTERVAL_MS = 10_000; // 续约间隔 10 秒
+public class SourceRegistry {
+    private static final String NAMESPACE = "SYNC_SOURCE_CONFIG";
     
     private final MQClientAPIImpl mqClientAPI;
-    private final String lockKey;      // 格式: {brokerName}:source:lock
-    private final String lockValue;    // 格式: {nodeId}:{timestamp}
-    private ScheduledFuture<?> renewTask;
+    private final String sourceNodeId;    // 当前 Source 的唯一标识
+    private final String zmqAddress;      // {host}:{zmqPort}
+    private ScheduledFuture<?> refreshTask;
     
     /**
-     * 尝试获取锁
-     * 1. 读取当前锁值
-     * 2. 如果锁不存在 → CAS 写入自身信息
-     * 3. 如果锁存在但 TTL 已过期 → CAS 覆盖写入
-     * 4. 如果锁存在且未过期 → 获取失败
+     * 注册 Source ZMQ 地址到源集群 NameServer KV
+     * key 为 sourceNodeId，多个 Source 各自注册互不冲突
      */
-    @Override
-    public boolean tryLock() {
-        String currentLock = mqClientAPI.getKVConfig(NAMESPACE, lockKey);
+    public void register() {
+        String value = zmqAddress + ":" + System.currentTimeMillis();
+        mqClientAPI.putKVConfig(NAMESPACE, sourceNodeId, value);
+        log.info("Source 注册成功: key={}, value={}", sourceNodeId, value);
         
-        if (currentLock == null || isExpired(currentLock)) {
-            // CAS 写入锁
-            boolean success = mqClientAPI.putKVConfigIfAbsent(
-                NAMESPACE, lockKey, lockValue);
-            if (success) {
-                startRenewTask();
-                return true;
-            }
-        }
-        return false;
+        // 启动定期刷新（每 30s），保持注册信息时效性
+        refreshTask = scheduler.scheduleAtFixedRate(
+            this::refresh, 30_000, 30_000, TimeUnit.MILLISECONDS);
     }
     
     /**
-     * 定期续约（每 10 秒更新锁的 timestamp，防止 TTL 过期）
+     * 刷新注册信息（更新 timestamp）
      */
-    private void startRenewTask() {
-        renewTask = scheduler.scheduleAtFixedRate(() -> {
-            String renewValue = nodeId + ":" + System.currentTimeMillis();
-            mqClientAPI.putKVConfig(NAMESPACE, lockKey, renewValue);
-        }, RENEW_INTERVAL_MS, RENEW_INTERVAL_MS, TimeUnit.MILLISECONDS);
+    public void refresh() {
+        String value = zmqAddress + ":" + System.currentTimeMillis();
+        mqClientAPI.putKVConfig(NAMESPACE, sourceNodeId, value);
     }
     
-    @Override
-    public void unlock() {
-        renewTask.cancel(false);
-        mqClientAPI.deleteKVConfig(NAMESPACE, lockKey);
+    /**
+     * 注销 — 优雅关闭时删除自身注册信息
+     */
+    public void unregister() {
+        if (refreshTask != null) {
+            refreshTask.cancel(false);
+        }
+        mqClientAPI.deleteKVConfig(NAMESPACE, sourceNodeId);
+        log.info("Source 注销成功: key={}", sourceNodeId);
     }
 }
 ```
 
-**NameServer KV 锁数据模型**：
-
-```
-Namespace: SYNC_SOURCE_LOCK
-├── Key: {brokerName}:source:lock
-└── Value: {nodeId}:{timestamp}    // 持有者标识 + 最后续约时间
-                                    // 当 currentTime - timestamp > TTL 时视为过期
-```
-
-**方案二：ZooKeeper 临时节点锁**
+**Sink 发现 Source 地址列表**：
 
 ```java
 /**
- * 基于 ZooKeeper 临时节点实现的分布式锁
- * 原理：利用 ZooKeeper 临时有序节点 + Watcher 实现互斥锁
- *       节点会话断开时自动释放锁
+ * Sink 通过源集群 NameServer KV 发现所有已注册的 Source 实例
+ * 遍历 SYNC_SOURCE_CONFIG 命名空间下的所有 key，获取 Source 地址列表
  */
-public class ZookeeperLock implements DistributedLock {
-    private static final String LOCK_PATH = "/ha-sync/source-lock";
+public class SourceDiscovery {
+    private static final String NAMESPACE = "SYNC_SOURCE_CONFIG";
+    private static final long STALE_THRESHOLD_MS = 90_000; // 超过 90s 未刷新视为过期
     
-    private final CuratorFramework zkClient;
-    private final InterProcessMutex mutex;
-    private final String nodeId;
-    
-    public ZookeeperLock(String zkAddr, String brokerName, String nodeId) {
-        this.zkClient = CuratorFrameworkFactory.newClient(
-            zkAddr, new ExponentialBackoffRetry(1000, 3));
-        this.mutex = new InterProcessMutex(zkClient, 
-            LOCK_PATH + "/" + brokerName);
-        this.nodeId = nodeId;
-    }
-    
-    @Override
-    public boolean tryLock() {
-        try {
-            return mutex.acquire(5, TimeUnit.SECONDS);
-        } catch (Exception e) {
-            log.warn("ZooKeeper 锁获取失败", e);
-            return false;
+    /**
+     * 发现所有活跃的 Source ZMQ 地址
+     * @return 活跃 Source 地址列表
+     */
+    public List<String> discoverActiveSources() {
+        Map<String, String> allEntries = mqClientAPI.getKVListByNamespace(NAMESPACE);
+        List<String> activeSources = new ArrayList<>();
+        
+        long now = System.currentTimeMillis();
+        for (Map.Entry<String, String> entry : allEntries.entrySet()) {
+            String[] parts = entry.getValue().split(":");
+            // value 格式: {host}:{zmqPort}:{timestamp}
+            long timestamp = Long.parseLong(parts[2]);
+            if (now - timestamp < STALE_THRESHOLD_MS) {
+                activeSources.add(parts[0] + ":" + parts[1]);
+            } else {
+                log.warn("Source {} 注册信息已过期（{}ms），跳过", 
+                    entry.getKey(), now - timestamp);
+            }
         }
-    }
-    
-    @Override
-    public void unlock() {
-        try {
-            mutex.release();
-        } catch (Exception e) {
-            log.warn("ZooKeeper 锁释放异常", e);
-        }
+        return activeSources;
     }
 }
 ```
 
-**锁相关配置参数（新增到 SourceConfig）**：
+#### 11.3.2 Source 故障恢复流程（外部工具拉起）
 
-| 参数 | 环境变量 | 默认值 | 说明 |
-|------|---------|--------|------|
-| `--lockProvider` | `HA_SOURCE_LOCK_PROVIDER` | `nameserver-kv` | 分布式锁实现：`nameserver-kv` / `zookeeper` |
-| `--zkAddr` | `HA_SOURCE_ZK_ADDR` | — | ZooKeeper 地址（仅 `zookeeper` 模式需要） |
-| `--lockTtlMs` | `HA_SOURCE_LOCK_TTL_MS` | `30000` | 锁 TTL（仅 `nameserver-kv` 模式） |
-| `--lockRenewIntervalMs` | `HA_SOURCE_LOCK_RENEW_INTERVAL_MS` | `10000` | 锁续约间隔 |
+> **对应需求**：需求 18 §3
 
-#### 11.3.2 Source 故障转移流程
-
-> **对应需求**：需求 18 §2
+**设计原则**：Source 本身不实现故障转移逻辑，完全依赖外部运维工具（K8s、Supervisor、systemd 等）自动拉起。
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│                    Source 故障转移流程                             │
+│                    Source 故障恢复流程                             │
 └──────────────────────────────────────────────────────────────────┘
 
  正常运行状态：
-   Source-A 持有分布式锁，定期续约（每 10s）
-   Source-B 处于备用状态，定期尝试获取锁（每 5s）
+   Source-A 运行中，定期刷新源集群 NameServer KV 注册（每 30s）
+   Source-B 独立运行（可选，多 Source 场景），各自注册独立 KV
 
  故障发生：
-   Source-A 宕机 → 锁续约停止 → TTL 过期（30s 后锁自动释放）
-   （ZooKeeper 模式：会话断开 → 临时节点自动删除 → 锁立即释放）
+   Source-A 宕机 → KV 注册信息停止刷新 → 超过 90s 后 Sink 视为过期
+   外部运维工具检测到 Source-A 进程退出
 
- 故障转移：
-   1. Source-B 尝试获取锁 → 成功
-   2. Source-B 从 NameServer KV 读取 globalCheckpoint
-   3. Source-B 注册自身 ZMQ 地址到 NameServer KV（覆盖 Source-A 的旧地址）
-   4. Source-B 连接 Master，从 globalCheckpoint 断点续传
-   5. Sink 通过 NameServer KV 感知 Source 地址变更，自动重连新 Source
+ 故障恢复：
+   1. 外部工具（K8s / Supervisor）自动重新拉起 Source-A
+   2. 新 Source-A 启动，使用相同的 sourceNodeId 注册到源集群 NameServer KV
+   3. Source-A 从目标集群 NameServer KV 读取 globalCheckpoint
+   4. Source-A 连接 Master，从 globalCheckpoint 断点续传
+   5. Sink 通过源集群 NameServer KV 感知 Source-A 地址刷新，自动重连
 
  故障恢复时间：
-   - NameServer KV 模式：锁 TTL（30s）+ 探测间隔（5s）= 最长 35s
-   - ZooKeeper 模式：会话超时（10s）+ 探测间隔（5s）= 最长 15s
+   取决于外部运维工具的拉起速度（通常秒级）
 ```
 
 ```mermaid
 sequenceDiagram
-    participant A as Source-A（活跃）
-    participant B as Source-B（备用）
-    participant Lock as 分布式锁
-    participant NS as NameServer KV
+    participant A as Source-A
+    participant Tool as 外部运维工具
+    participant NS_SRC as 源集群 NameServer KV
+    participant NS_TGT as 目标集群 NameServer KV
     participant Master as Master Broker
 
-    Note over A: 正常运行，持有锁
-    A->>Lock: 续约（每 10s）
-    A->>NS: 刷新 ZMQ 地址（每 30s）
-    
+    Note over A: 正常运行，定期刷新注册
+    A->>NS_SRC: PUT(SYNC_SOURCE_CONFIG, sourceNodeId, addr:timestamp)
+
     Note over A: ⚡ Source-A 宕机
-    A--xLock: 续约停止
-    
-    B->>Lock: 尝试获取锁（每 5s）
-    Note over Lock: TTL 30s 过期
-    Lock-->>B: 获取锁成功
-    
-    B->>NS: 读取 globalCheckpoint
-    NS-->>B: checkpoint = 1234567890
-    
-    B->>NS: 注册 ZMQ 地址（覆盖 Source-A）
-    B->>Master: TCP 连接，上报 slaveMaxOffset = 1234567890
-    Master-->>B: 从断点继续推送数据
-    
-    Note over B: Source-B 成为活跃节点
+    A--xNS_SRC: 注册停止刷新
+
+    Tool->>Tool: 检测到进程退出
+    Tool->>A: 自动拉起新实例
+
+    A->>NS_SRC: 重新注册 ZMQ 地址
+    A->>NS_TGT: 读取 globalCheckpoint
+    NS_TGT-->>A: checkpoint = 1234567890
+    A->>Master: TCP 连接，上报 slaveMaxOffset = 1234567890
+    Master-->>A: 从断点继续推送数据
+
+    Note over A: Source-A 恢复正常运行
 ```
 
-#### 11.3.3 Sink 分布式负载均衡算法
+#### 11.3.3 Sink 分布式消费（Source 分发模式）
 
-> **对应需求**：需求 18 §6-8
+> **对应需求**：需求 18 §8-10
 
-**设计目标**：Sink 根据 Source 统计的各 Topic 流量占比，将消息均匀分配到多个 Sink 节点处理，各节点负载偏差不超过 10%。
+**设计目标**：Source 将流量分发给已注册的 Sink 列表，不做复杂的负载均衡计算。Sink 通过 ZMQ REQ 向 Source 发送 PullRequest，Source 按请求返回数据。
 
-**流量统计获取方式**：
+**Sink 注册机制**：
 
-Sink 通过两种途径获取 `topicBytesStats`：
-1. **ZMQ PullResponse 附带**：每次 PullResponse 中包含最新的 `topicBytesStats` 快照
-2. **NameServer KV 读取**：定期（每 30s）从 NameServer KV 读取 Source 发布的统计数据
+每个 Sink 启动后向 Source 注册自身：
+- Sink 通过 ZMQ PullRequest 中的 `sinkId` 字段自动注册
+- Source 维护已注册的活跃 Sink 列表
+- Sink 停止发送 PullRequest 超过 60 秒后，Source 视为下线并从列表移除
+
+**数据分发流程**：
 
 ```
-Namespace: SYNC_CHECKPOINT
-Key: {brokerName}:source:topicStats
-Value: TopicA:102400000,TopicB:51200000,TopicC:25600000
+Source                                                    Sink-1 / Sink-2 / Sink-N
+  │                                                              │
+  │◄──── PullRequest(sinkId, fromOffset, topicFilter) ──────────┤
+  │                                                              │
+  ├────► PullResponse(records[], maxOffset) ────────────────────►│
+  │                                                              │
+  │   Source 维护 Sink 列表，按 PullRequest 顺序响应             │
+  │   每个 Sink 独立拉取，独立消费                                │
+  │   不做流量均衡计算                                            │
+  │                                                              │
 ```
 
-**负载均衡算法 — 基于流量权重的一致性哈希**：
+**Source 端 Sink 管理**：
 
 ```java
 /**
- * 分布式 Sink 负载均衡器
- * 算法：基于 Topic 流量权重的确定性分配
- * 
- * 分配规则：
- * 1. 计算各 Topic 的流量占比（bytesPercent）
- * 2. 将 Topic 按流量从大到小排序
- * 3. 贪心算法：依次将 Topic 分配给当前负载最轻的 Sink 节点
- * 4. 保证各节点负载偏差 ≤ 10%
+ * Source 端 Sink 列表管理
+ * 按 PullRequest 自动注册/注销 Sink，不做负载均衡
  */
-public class DistributedLoadBalancer {
-    
-    /** 
-     * 活跃 Sink 节点列表（从 NameServer KV 中发现）
-     * Namespace: SYNC_SINK_REGISTRY
-     * Key: {brokerName}:sink:{sinkId}:heartbeat
-     * Value: {timestamp}
-     */
-    private final List<String> activeSinkIds;
-    
-    /** 各 Sink 节点负责的 Topic 集合 */
-    private final Map<String, Set<String>> sinkTopicAssignment;
+public class SinkRegistry {
+    /** 活跃 Sink 列表：sinkId → 最后一次 PullRequest 时间 */
+    private final ConcurrentHashMap<String, Long> activeSinks = new ConcurrentHashMap<>();
+    private static final long SINK_TIMEOUT_MS = 60_000; // 60s 未请求视为下线
     
     /**
-     * 计算 Topic → Sink 分配映射
-     * 
-     * @param topicBytesStats 各 Topic 累计字节数
-     * @param sinkIds 活跃 Sink 节点列表
-     * @return Topic → sinkId 的映射
+     * 处理 PullRequest 时自动注册/刷新 Sink
      */
-    public Map<String, String> calculateAssignment(
-            Map<String, Long> topicBytesStats, List<String> sinkIds) {
-        
-        if (sinkIds.size() <= 1) {
-            // 单 Sink 模式，所有 Topic 分配给唯一 Sink
-            return topicBytesStats.keySet().stream()
-                .collect(Collectors.toMap(t -> t, t -> sinkIds.get(0)));
+    public void onPullRequest(String sinkId) {
+        Long previous = activeSinks.put(sinkId, System.currentTimeMillis());
+        if (previous == null) {
+            log.info("新 Sink 节点注册: sinkId={}, 当前活跃 Sink 数: {}", 
+                sinkId, activeSinks.size());
         }
-        
-        // 1. 按流量从大到小排序
-        List<Map.Entry<String, Long>> sortedTopics = topicBytesStats.entrySet()
-            .stream()
-            .sorted(Map.Entry.<String, Long>comparingByValue().reversed())
-            .collect(Collectors.toList());
-        
-        // 2. 初始化各 Sink 的累计负载
-        Map<String, Long> sinkLoad = new LinkedHashMap<>();
-        for (String sinkId : sinkIds) {
-            sinkLoad.put(sinkId, 0L);
-        }
-        
-        // 3. 贪心分配：将每个 Topic 分配给当前负载最轻的 Sink
-        Map<String, String> assignment = new HashMap<>();
-        for (Map.Entry<String, Long> entry : sortedTopics) {
-            String topic = entry.getKey();
-            long bytes = entry.getValue();
-            
-            // 找到当前负载最轻的 Sink
-            String lightestSink = sinkLoad.entrySet().stream()
-                .min(Map.Entry.comparingByValue())
-                .get().getKey();
-            
-            assignment.put(topic, lightestSink);
-            sinkLoad.merge(lightestSink, bytes, Long::sum);
-        }
-        
-        // 4. 验证负载偏差
-        long maxLoad = Collections.max(sinkLoad.values());
-        long minLoad = Collections.min(sinkLoad.values());
-        long avgLoad = sinkLoad.values().stream()
-            .mapToLong(Long::longValue).sum() / sinkIds.size();
-        
-        double deviation = avgLoad > 0 
-            ? (double)(maxLoad - minLoad) / avgLoad * 100 : 0;
-        
-        if (deviation > 10.0) {
-            log.warn("负载均衡偏差 {:.1f}% 超过阈值 10%，尝试细粒度再均衡", 
-                deviation);
-            rebalanceFinegrained(assignment, sinkLoad, topicBytesStats);
-        }
-        
-        return assignment;
     }
     
     /**
-     * 细粒度再均衡：将负载最重节点的最小 Topic 迁移到负载最轻节点
-     * 迭代直到偏差 ≤ 10% 或无法进一步优化
+     * 定期清理超时 Sink（每 30s 执行一次）
      */
-    private void rebalanceFinegrained(Map<String, String> assignment,
-            Map<String, Long> sinkLoad, Map<String, Long> topicBytesStats) {
-        for (int i = 0; i < 100; i++) {  // 最多迭代 100 次
-            String heaviest = findHeaviestSink(sinkLoad);
-            String lightest = findLightestSink(sinkLoad);
-            
-            if (sinkLoad.get(heaviest) - sinkLoad.get(lightest) 
-                    <= sinkLoad.values().stream().mapToLong(Long::longValue).sum() 
-                       / sinkLoad.size() * 0.1) {
-                break;  // 偏差已 ≤ 10%
+    public void evictStaleSinks() {
+        long now = System.currentTimeMillis();
+        activeSinks.entrySet().removeIf(entry -> {
+            if (now - entry.getValue() > SINK_TIMEOUT_MS) {
+                log.info("Sink 节点超时下线: sinkId={}", entry.getKey());
+                return true;
             }
-            
-            // 从最重节点找到可迁移的最小 Topic
-            Optional<String> topicToMove = assignment.entrySet().stream()
-                .filter(e -> e.getValue().equals(heaviest))
-                .min(Comparator.comparingLong(e -> topicBytesStats.get(e.getKey())))
-                .map(Map.Entry::getKey);
-            
-            if (topicToMove.isPresent()) {
-                String topic = topicToMove.get();
-                long bytes = topicBytesStats.get(topic);
-                assignment.put(topic, lightest);
-                sinkLoad.merge(heaviest, -bytes, Long::sum);
-                sinkLoad.merge(lightest, bytes, Long::sum);
-            } else {
-                break;
-            }
-        }
+            return false;
+        });
+    }
+    
+    /**
+     * 获取当前活跃 Sink 数量
+     */
+    public int getActiveSinkCount() {
+        return activeSinks.size();
+    }
+    
+    /**
+     * 获取活跃 Sink ID 列表
+     */
+    public Set<String> getActiveSinkIds() {
+        return Collections.unmodifiableSet(activeSinks.keySet());
     }
 }
 ```
 
-**负载均衡数据流**：
+#### 11.3.4 Source 启动日志
 
-```
-Source                              NameServer KV                     Sink-1 / Sink-2 / Sink-N
-  │                                      │                                   │
-  ├─► 统计 topicBytesStats ─────────────►│ PUT topicStats                    │
-  │   每 10s 更新                         │                                   │
-  │                                      │                                   │
-  │                                      │◄─── GET topicStats ──────────────┤
-  │                                      │     每 30s 读取                   │
-  │                                      │                                   │
-  │                                      │                                   ├─► DistributedLoadBalancer
-  │                                      │                                   │   .calculateAssignment()
-  │                                      │                                   │
-  │                                      │                                   ├─► 仅消费分配给自己的 Topic
-  │                                      │                                   │   → PullRequest.topicFilter
-  │◄──── PullRequest(topicFilter) ───────┼───────────────────────────────────┤
-  │                                      │                                   │
-  ├────► PullResponse ──────────────────►│                                   │
-  │                                      │                                   │
-```
-
-#### 11.3.4 Sink 节点发现与再均衡
-
-> **对应需求**：需求 18 §8
-
-**Sink 节点注册**：
-
-每个 Sink 启动后将自身注册到 NameServer KV：
-
-```
-Namespace: SYNC_SINK_REGISTRY
-Key: {brokerName}:sink:{sinkId}:heartbeat
-Value: {timestamp}
-```
-
-每 15 秒刷新一次心跳。心跳超过 60 秒未更新的 Sink 视为下线。
-
-**再均衡触发条件**：
-
-| 触发条件 | 检测方式 | 处理 |
-|---------|---------|------|
-| 新 Sink 节点加入 | 定期（30s）检查 SYNC_SINK_REGISTRY 节点数变化 | 触发 rebalance |
-| Sink 节点下线 | 心跳超时（60s 未更新） | 触发 rebalance |
-| Topic 流量分布剧烈变化 | 最大/最小 Sink 负载偏差 > 20% | 触发 rebalance |
-
-**再均衡流程**：
-
-```
-1. 任意 Sink 检测到节点数变化
-
-2. 所有 Sink 同时重新读取 topicBytesStats 和 activeSinkIds
-
-3. 各 Sink 使用相同的 DistributedLoadBalancer.calculateAssignment() 算法
-   → 输入相同（topicBytesStats + sinkIds 排序后列表）
-   → 输出确定性一致（无需协调即可达成一致分配结果）
-
-4. 各 Sink 更新自身的 topicFilter
-   → 仅消费分配给自己的 Topic
-
-5. 下一次 PullRequest 携带新的 topicFilter
-   → 平滑过渡，无需停机
-
-注意：再均衡期间可能存在短暂的消息重复处理（At-Least-Once）
-```
-
-#### 11.3.5 Source 启动日志
-
-> **对应需求**：需求 18 §3
+> **对应需求**：需求 18 §4
 
 ```
 INFO [main] HASource - =============================================
 INFO [main] HASource - Source 节点启动
-INFO [main] HASource -   nodeId: source-node-01
-INFO [main] HASource -   lockProvider: nameserver-kv
-INFO [main] HASource -   lockKey: broker-a:source:lock
-INFO [main] HASource -   lockTTL: 30000ms
+INFO [main] HASource -   sourceNodeId: source-node-01
+INFO [main] HASource -   sourceNamesrv: 252.148.*.***:9876
+INFO [main] HASource -   targetNamesrv: 83.5.*.***:9876
+INFO [main] HASource -   zmqBindPort: 5555
 INFO [main] HASource -   pid: 12345
 INFO [main] HASource -   hostname: prod-server-01
 INFO [main] HASource - =============================================
@@ -3606,7 +3456,7 @@ public class RocketMQClusterManager {
                     │ HA 协议（TCP）
                     ▼
 ┌────────────────────────────────────────────────────────────┐
-│                  Source Worker（单节点）                     │
+│                  Source Worker（无状态，可多实例）               │
 │  ┌──────────────────────────────────────────────────────┐  │
 │  │ HASource                                             │  │
 │  │  - HA Connection (Master TCP)                        │  │
@@ -3632,7 +3482,7 @@ public class RocketMQClusterManager {
 │  └──────────────────────────────────────────────────────┘  │
 ├────────────────────────────────────────────────────────────┤
 │                  Sink Worker 2 ... N                        │
-│  (多个 Sink 并行，按 Topic 流量负载均衡)                    │
+│  (多个 Sink 并行，Source 按 PullRequest 分发数据)           │
 └────────────────────────────────────────────────────────────┘
                     │
                     │ RocketMQ 协议
@@ -3652,7 +3502,7 @@ public class RocketMQClusterManager {
 ### 13.2 启动命令示例
 
 ```bash
-# Source Worker 启动（单节点）
+# Source Worker 启动（无状态，可多实例）
 java -jar ha-sync.jar \
   --mode=source \
   --sourceNamesrv=192.168.1.100:9876;192.168.1.101:9876 \
@@ -3725,7 +3575,7 @@ CMD ["--configFile=/app/ha-sync-source.properties"]
 | 故障现象 | 排查步骤 |
 |---------|---------|
 | Source 无法连接 Master | ① 检查 NameServer 地址 ② 检查 Master HA 端口（10912） ③ 检查网络连通性 |
-| Sink 无法发现 Source | ① 检查 NameServer KV（`SYNC_SOURCE_CONFIG`） ② 检查 ZMQ 端口 |
+| Sink 无法发现 Source | ① 检查源集群 NameServer KV（`SYNC_SOURCE_CONFIG`）中是否有 Source 注册 ② 检查 ZMQ 端口 |
 | 同步滞后严重 | ① 检查 Sink 线程数 ② 检查目标集群写入性能 ③ 增加 Sink 节点 |
 | 消息重复 | ① At-Least-Once 语义正常现象 ② 检查启动一致性校验配置 |
 | Topic 同步暂停 | ① 检查源集群 Topic 是否存在 ② `POST /resume` 手动恢复 ③ 检查目标集群权限 |
@@ -3764,7 +3614,7 @@ CMD ["--configFile=/app/ha-sync-source.properties"]
 | 需求 15 | 网络抖动自动重试 | 第 7.6 章 |
 | 需求 16 | 目标不可写监控 | 第 7.7 章 |
 | 需求 17 | 优雅停机快照 | 第 5.7 章 |
-| 需求 18 | 分布式负载均衡 | 第 11.3 章（含 11.3.1~11.3.5 详细设计） |
+| 需求 18 | Source 多实例注册与 Sink 分布式消费 | 第 11.3 章（含 11.3.1~11.3.4 详细设计） |
 | 需求 19 | 全链路 Trace 监控 | 第 8.6 章（含 8.6.1~8.6.5 TraceCollector 详细设计）、9 章 |
 | 需求 20 | 监控指标采集 | 第 8 章（含 8.8.3 滑动窗口指标计算实现） |
 

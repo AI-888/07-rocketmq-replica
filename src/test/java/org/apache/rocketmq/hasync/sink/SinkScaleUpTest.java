@@ -35,7 +35,7 @@ import static org.junit.Assert.*;
  *   <li>扩容后新 Sink 的 Checkpoint 独立管理</li>
  *   <li>队列数增加后 FixedQueueSelector 的映射正确性</li>
  *   <li>扩容过程中数据不丢失、不重复</li>
- *   <li>扩容后各 Sink 负载均衡</li>
+ *   <li>扩容后各 Sink 独立拉取，Source 按 PullRequest 分发（不做负载均衡）</li>
  *   <li>目标集群队列扩容（4→8）的写入行为</li>
  * </ul>
  */

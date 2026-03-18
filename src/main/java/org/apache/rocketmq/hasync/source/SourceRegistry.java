@@ -9,15 +9,16 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Source ZMQ 地址注册到目标集群 NameServer KV
+ * Source ZMQ 地址注册到源集群 NameServer KV
  * <p>
- * 将 Source 的 ZMQ REP Socket 地址注册到目标集群 NameServer KV 中，
- * Sink 通过 NameServer KV 自动发现 Source 地址。
+ * 将 Source 的 ZMQ REP Socket 地址注册到源集群 NameServer KV 中，
+ * 每个 Source 使用自身唯一的 sourceNodeId 作为 key，支持多 Source 并存。
+ * Sink 通过源集群 NameServer KV 扫描所有 Source 地址列表进行连接。
  * <p>
  * KV 存储结构：
  * <ul>
  *   <li>namespace: SYNC_SOURCE_CONFIG</li>
- *   <li>key: {brokerName}</li>
+ *   <li>key: {sourceNodeId}</li>
  *   <li>value: {host}:{zmqPort}:{timestamp}</li>
  * </ul>
  */
@@ -31,8 +32,8 @@ public class SourceRegistry {
     /** 默认刷新间隔（毫秒） */
     private static final long DEFAULT_REFRESH_INTERVAL = 30000;
 
-    private final String targetNamesrvAddr;
-    private final String brokerName;
+    private final String sourceNamesrvAddr;
+    private final String sourceNodeId;
     private final String zmqHost;
     private final int zmqPort;
     private final AtomicBoolean registered = new AtomicBoolean(false);
@@ -56,9 +57,9 @@ public class SourceRegistry {
         void deleteKVConfig(String namespace, String key) throws Exception;
     }
 
-    public SourceRegistry(String targetNamesrvAddr, String brokerName, String zmqHost, int zmqPort) {
-        this.targetNamesrvAddr = targetNamesrvAddr;
-        this.brokerName = brokerName;
+    public SourceRegistry(String sourceNamesrvAddr, String sourceNodeId, String zmqHost, int zmqPort) {
+        this.sourceNamesrvAddr = sourceNamesrvAddr;
+        this.sourceNodeId = sourceNodeId;
         this.zmqHost = zmqHost;
         this.zmqPort = zmqPort;
     }
@@ -76,11 +77,11 @@ public class SourceRegistry {
         }
 
         String value = buildRegistryValue();
-        callback.putKVConfig(NAMESPACE, brokerName, value);
+        callback.putKVConfig(NAMESPACE, sourceNodeId, value);
         registered.set(true);
 
         log.info("Source ZMQ 地址已注册: namespace={}, key={}, value={}",
-                NAMESPACE, brokerName, value);
+                NAMESPACE, sourceNodeId, value);
 
         // 启动定期刷新
         scheduler = new ScheduledThreadPoolExecutor(1, r -> {
@@ -98,7 +99,7 @@ public class SourceRegistry {
     public void refresh() {
         try {
             String value = buildRegistryValue();
-            callback.putKVConfig(NAMESPACE, brokerName, value);
+            callback.putKVConfig(NAMESPACE, sourceNodeId, value);
             log.debug("Source 注册信息已刷新: {}", value);
         } catch (Exception e) {
             log.warn("刷新 Source 注册信息失败: {}", e.getMessage());
@@ -115,8 +116,8 @@ public class SourceRegistry {
 
         try {
             if (callback != null) {
-                callback.deleteKVConfig(NAMESPACE, brokerName);
-                log.info("Source ZMQ 地址已注销: namespace={}, key={}", NAMESPACE, brokerName);
+                callback.deleteKVConfig(NAMESPACE, sourceNodeId);
+                log.info("Source ZMQ 地址已注销: namespace={}, key={}", NAMESPACE, sourceNodeId);
             }
         } catch (Exception e) {
             log.warn("注销 Source 注册信息失败: {}", e.getMessage());
@@ -142,12 +143,12 @@ public class SourceRegistry {
         return registered.get();
     }
 
-    public String getTargetNamesrvAddr() {
-        return targetNamesrvAddr;
+    public String getSourceNamesrvAddr() {
+        return sourceNamesrvAddr;
     }
 
-    public String getBrokerName() {
-        return brokerName;
+    public String getSourceNodeId() {
+        return sourceNodeId;
     }
 
     public String getZmqAddress() {

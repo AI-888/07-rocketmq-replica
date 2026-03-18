@@ -164,14 +164,14 @@ public class RfqSinkTest {
     @Test
     public void testSourceRegistryRegister() throws Exception {
         MockRegistryCallback registryCb = new MockRegistryCallback();
-        SourceRegistry registry = new SourceRegistry("127.0.0.1:9876", "broker-a", "127.0.0.1", 5555);
+        SourceRegistry registry = new SourceRegistry("127.0.0.1:9876", "source-node-01", "127.0.0.1", 5555);
         registry.setCallback(registryCb);
 
         registry.register();
 
         assertTrue(registry.isRegistered());
         assertEquals("SYNC_SOURCE_CONFIG", registryCb.lastNamespace);
-        assertEquals("broker-a", registryCb.lastKey);
+        assertEquals("source-node-01", registryCb.lastKey);
         assertTrue(registryCb.lastValue.startsWith("127.0.0.1:5555:"));
 
         registry.unregister();
@@ -180,22 +180,22 @@ public class RfqSinkTest {
 
     @Test
     public void testSourceRegistryGetters() {
-        SourceRegistry registry = new SourceRegistry("10.0.0.1:9876", "broker-b", "10.0.0.2", 6666);
-        assertEquals("10.0.0.1:9876", registry.getTargetNamesrvAddr());
-        assertEquals("broker-b", registry.getBrokerName());
+        SourceRegistry registry = new SourceRegistry("10.0.0.1:9876", "source-node-02", "10.0.0.2", 6666);
+        assertEquals("10.0.0.1:9876", registry.getSourceNamesrvAddr());
+        assertEquals("source-node-02", registry.getSourceNodeId());
         assertEquals("10.0.0.2:6666", registry.getZmqAddress());
         assertEquals("SYNC_SOURCE_CONFIG", SourceRegistry.getNamespace());
     }
 
     @Test(expected = IllegalStateException.class)
     public void testSourceRegistryNoCallback() throws Exception {
-        SourceRegistry registry = new SourceRegistry("addr", "broker", "host", 5555);
+        SourceRegistry registry = new SourceRegistry("addr", "node-01", "host", 5555);
         registry.register(); // 应抛 IllegalStateException
     }
 
     @Test
     public void testSourceRegistryUnregisterNotRegistered() {
-        SourceRegistry registry = new SourceRegistry("addr", "broker", "host", 5555);
+        SourceRegistry registry = new SourceRegistry("addr", "node-01", "host", 5555);
         registry.unregister(); // 不应抛异常
     }
 
