@@ -14,10 +14,17 @@ import org.slf4j.LoggerFactory;
  *   <li>不干扰源集群的 ISR/OSR 和多副本机制</li>
  * </ul>
  * <p>
+ * <b>统一 ZMQ 通信模型：</b> Source 与 Sink 始终通过 ZeroMQ REQ-REP 模式通信，
+ * 无论是独立部署还是通过 --with-sink 同进程启动，通信协议完全一致。
+ * <p>
  * 用法：
  * <pre>
+ * # 独立部署模式
  * java -jar ha-sync.jar --mode source --sourceNamesrv addr --targetNamesrv addr
  * java -jar ha-sync.jar --mode sink --targetNamesrv addr
+ *
+ * # Source 同进程内嵌 Sink 模式
+ * java -jar ha-sync.jar --mode source --sourceNamesrv addr --targetNamesrv addr --withSink true
  * </pre>
  */
 public class HASyncMain {
@@ -87,9 +94,15 @@ public class HASyncMain {
         System.err.println("  source  启动 Source 进程（从源集群拉取数据）");
         System.err.println("  sink    启动 Sink 进程（向目标集群写入数据）");
         System.err.println();
+        System.err.println("通信模型: Source 与 Sink 统一通过 ZeroMQ REQ-REP 模式通信");
+        System.err.println();
         System.err.println("示例:");
+        System.err.println("  # 独立部署");
         System.err.println("  java -jar ha-sync.jar --mode source --sourceNamesrv 127.0.0.1:9876 --targetNamesrv 127.0.0.1:9877");
         System.err.println("  java -jar ha-sync.jar --mode sink --targetNamesrv 127.0.0.1:9877");
+        System.err.println();
+        System.err.println("  # Source 同进程内嵌 Sink");
+        System.err.println("  java -jar ha-sync.jar --mode source --sourceNamesrv 127.0.0.1:9876 --targetNamesrv 127.0.0.1:9877 --withSink true");
         System.exit(1);
     }
 }

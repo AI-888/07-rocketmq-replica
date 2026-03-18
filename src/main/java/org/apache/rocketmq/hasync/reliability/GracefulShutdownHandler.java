@@ -1,6 +1,5 @@
 package org.apache.rocketmq.hasync.reliability;
 
-import org.apache.rocketmq.hasync.core.SyncPipeline;
 import org.apache.rocketmq.hasync.core.SyncSource;
 import org.apache.rocketmq.hasync.core.SyncSink;
 import org.apache.rocketmq.hasync.metrics.MetricsCollector;

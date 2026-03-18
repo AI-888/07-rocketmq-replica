@@ -40,7 +40,7 @@ RocketMQ HA 数据同步组件是一个**独立的 Java 程序**，模拟 Rocket
 | 特性 | 说明 | 对应需求 |
 |------|------|---------|
 | **Source/Sink 解耦** | Source 专注数据拉取与解析，Sink 专注数据写入，可独立扩展 | 需求 2 |
-| **独立部署** | Source 和 Sink 作为独立 Worker 进程，通过 ZeroMQ（REQ-REP）通信 | 需求 2 §7-13 |
+| **统一 ZMQ 通信** | Source 和 Sink 始终通过 ZeroMQ（REQ-REP）通信，支持独立部署和同进程模式 | 需求 2 §7-13 |
 | **完全无状态** | 所有状态（Checkpoint 等）存储在目标集群 NameServer KV 中，可随意迁移替换 | 需求 2 §11-12 |
 | **消息顺序严格一致** | 按源集群 CommitLog 物理偏移量（`physicOffset`）严格升序写入目标集群 | 需求 2 §6a-6f |
 | **最终一致性** | At-Least-Once 语义 + 启动一致性校验，不丢消息 | 需求 10 |
@@ -80,13 +80,13 @@ RocketMQ HA 数据同步组件是一个**独立的 Java 程序**，模拟 Rocket
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
-│                          Sync Pipeline                                 │
+│                      Source Worker（单节点）                            │
 │                                                                        │
-│  ┌───────────────────┐                          ┌────────────────────┐ │
-│  │    HASource        │   SyncRecord Queue      │ Sink（分布式多节点）│ │
-│  │   (单节点拉取)     │ ─────────────────────►  │ (写入目标 RocketMQ) │ │
-│  │                    │  含流量统计元信息        │                    │ │
-│  └───────────────────┘                          └────────────────────┘ │
+│  ┌───────────────────┐   ZMQ REP Socket      ┌────────────────────┐   │
+│  │    HASource        │ ◄─── REQ-REP ─────►  │ Sink（分布式多节点）│   │
+│  │   (单节点拉取)     │   PullReq/PullResp   │ (写入目标 RocketMQ) │   │
+│  │                    │                       │                    │   │
+│  └───────────────────┘                        └────────────────────┘   │
 │          │                                               │             │
 │   CheckpointCoordinator（位点协调器）◄────────────────────┘             │
 └────────────────────────────────────────────────────────────────────────┘
@@ -113,11 +113,17 @@ RocketMQ HA 数据同步组件是一个**独立的 Java 程序**，模拟 Rocket
                     │  目标集群 RocketMQ         │
                     │  (消息写入 + RFQ)          │
                     └───────────────────────────┘
+
+注意：Source 支持通过 --with-sink 参数在同一进程内嵌启动 Sink 实例，
+此时 Sink 通过 localhost:{zmqPort} 连接 Source ZMQ Socket，
+通信协议和服务发现逻辑与独立部署完全一致。
 ```
 
-### 2.2 Source/Sink 独立部署架构
+### 2.2 Source/Sink 部署架构（统一 ZMQ 通信）
 
-> **对应需求**：需求 2 §7-13（Source 与 Sink 独立部署、ZeroMQ 通信、NameServer KV 服务发现）
+> **对应需求**：需求 2 §7-13（Source 与 Sink 通信、ZeroMQ 通信、NameServer KV 服务发现）
+> 
+> **核心原则**：Source 和 Sink 始终通过 ZMQ REQ-REP 模式通信，无论独立部署还是同进程模式（`--with-sink`），通信协议和服务发现逻辑完全一致。
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
@@ -465,74 +471,76 @@ public interface CheckpointCoordinator {
 }
 ```
 
-### 4.2 SyncPipeline（管道）
+### 4.2 统一通信模型（ZMQ REQ-REP）
 
-> **对应需求**：需求 2 §2
+> **对应需求**：需求 2 §2、§7-13
+
+> **设计原则**：删除原有的 SyncPipeline 单进程 BlockingQueue 模式。Source 与 Sink 之间**统一**通过 ZeroMQ REQ-REP 模式通信。Source 可通过 `--with-sink` 参数在同一进程内嵌启动 Sink 实例，此时 Sink 通过 `localhost:{zmqPort}` 连接 Source，通信协议和服务发现逻辑与独立部署完全相同，消除维护差异。
+
+#### 4.2.1 通信架构
+
+```
+独立部署模式：
+  Source Worker (ZMQ REP :5555)  ←── ZMQ REQ ──  Sink Worker 1..N
+
+同进程模式（--with-sink）：
+  Source Worker (ZMQ REP :5555)  ←── ZMQ REQ ──  内嵌 Sink（localhost:5555）
+  （通信协议完全相同，仅连接地址为 localhost）
+```
+
+#### 4.2.2 SourceBootstrap 启动流程
 
 ```java
 /**
- * 组装 Source 和 Sink，管理生命周期
+ * Source 进程启动器 — 支持 --with-sink 参数内嵌 Sink
  */
-public class SyncPipeline {
-    private final SyncSource source;
-    private final List<SyncSink> sinks;
-    private final BlockingQueue<SyncRecord> queue;  // 默认容量 1000
-    private volatile boolean running = false;
-    
-    public SyncPipeline(SyncSource source, List<SyncSink> sinks, int queueCapacity) {
-        this.source = source;
-        this.sinks = sinks;
-        this.queue = new LinkedBlockingQueue<>(queueCapacity);
-    }
-    
-    public void start() throws Exception {
-        running = true;
+public class SourceBootstrap {
+    public static void main(String[] args) {
+        SourceConfig config = new SourceConfig();
+        config.load(args);
         
-        // 1. 启动 Source
+        // 1. 创建并启动 HASource（ZMQ REP Socket）
+        HASource source = new HASource(config);
         source.start();
         
-        // 2. 启动所有 Sink
-        for (SyncSink sink : sinks) {
-            sink.start();
+        // 2. 如果指定了 --with-sink，在同进程内启动 Sink
+        if (config.isWithSink()) {
+            SinkConfig sinkConfig = buildEmbeddedSinkConfig(config);
+            SinkBootstrap.startEmbeddedSink(sinkConfig);
+            log.info("内嵌 Sink 已启动，通过 localhost:{} 连接 Source ZMQ", 
+                     config.getZmqBindPort());
         }
         
-        // 3. Source 线程：poll → offer 到队列
-        sourceThread = new Thread(() -> {
-            while (running) {
-                try {
-                    source.poll();  // 内部将 SyncRecord 放入队列
-                } catch (Exception e) {
-                    if (isUnrecoverable(e)) {
-                        log.error("Source 发生不可恢复异常，停止管道", e);
-                        stopAll();
-                    }
-                }
-            }
-        }, "source-poll-thread");
-        
-        // 4. Sink 线程：从队列 poll → write
-        for (SyncSink sink : sinks) {
-            Thread sinkThread = new Thread(() -> {
-                while (running) {
-                    SyncRecord record = queue.poll(100, MILLISECONDS);
-                    if (record != null) {
-                        sink.write(record);
-                    }
-                }
-            }, "sink-write-thread");
-            sinkThread.start();
-        }
+        // 3. 注册 ShutdownHook
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            source.stop();
+        }));
     }
     
-    public void stopAll() {
-        running = false;
-        source.stop();
-        for (SyncSink sink : sinks) {
-            sink.stop();
-        }
+    /**
+     * 为内嵌 Sink 构建配置：
+     * - targetNamesrv 继承自 Source
+     * - Source ZMQ 地址固定为 localhost:{zmqPort}
+     */
+    private static SinkConfig buildEmbeddedSinkConfig(SourceConfig sourceConfig) {
+        SinkConfig sinkConfig = new SinkConfig();
+        // Sink 通过 localhost 连接同进程的 Source ZMQ
+        // 服务发现和通信逻辑与独立部署完全一致
+        return sinkConfig;
     }
 }
 ```
+
+#### 4.2.3 Sink 拉取流程（统一逻辑）
+
+无论 Sink 是独立部署还是内嵌在 Source 进程中，均执行以下流程：
+
+1. 从目标集群 NameServer KV 发现 Source ZMQ 地址
+2. 通过 ZMQ REQ Socket 连接 Source
+3. 发送 PullRequest（含 fromOffset、topicFilter、batchSize、sinkId）
+4. 接收 PullResponse（含 records[]、maxOffset、status）
+5. 将消息写入目标 RocketMQ 集群
+6. 更新 commitOffset 到 NameServer KV
 
 ### 4.3 HASource（数据源实现）
 
@@ -2039,18 +2047,18 @@ public class SinkRetryPolicy {
 
 | 指标名称 | 类型 | 说明 | 采集来源 |
 |---------|------|------|---------|
-| `syncBytesPerSecond` | Gauge | 每秒同步字节数（滑动窗口 1s） | SyncPipeline |
-| `queueSize` | Gauge | 内部队列当前积压 SyncRecord 数量 | SyncPipeline |
+| `syncBytesPerSecond` | Gauge | 每秒同步字节数（滑动窗口 1s） | HASource |
+| `queueSize` | Gauge | Source 内存缓冲区当前积压 SyncRecord 数量 | HASource |
 | `confirmedOffset` | Gauge | 当前已确认位点 | CheckpointCoordinator |
 | `masterOffset` | Gauge | Master 最新偏移量 | HASource |
-| `lagBytes` | Gauge | `masterOffset - confirmedOffset`（同步滞后） | SyncPipeline |
+| `lagBytes` | Gauge | `masterOffset - confirmedOffset`（同步滞后） | HASource |
 | `lastCheckpointFlushTime` | Gauge | 最近 Checkpoint 刷写成功时间（ISO-8601） | CheckpointCoordinator |
 | `metaSyncSuccessCount` | Counter | 元数据同步成功累计次数 | MetadataSyncService |
 | `metaSyncErrorCount` | Counter | 元数据同步失败累计次数 | MetadataSyncService |
 | `lastMetaSyncTime` | Gauge | 最近元数据同步成功时间（ISO-8601） | MetadataSyncService |
 | `avgEndToEndLatencyMs` | Gauge | 平均端到端延迟（ms，滑动窗口 1min） | TraceCollector |
 | `p99EndToEndLatencyMs` | Gauge | P99 端到端延迟（ms，滑动窗口 1min） | TraceCollector |
-| `currentTps` | Gauge | 当前 TPS（条/秒，滑动窗口 1s） | SyncPipeline |
+| `currentTps` | Gauge | 当前 TPS（条/秒，滑动窗口 1s） | HASource |
 
 ### 8.4 HTTP 监控接口
 
@@ -2171,6 +2179,352 @@ GET /health
 | `SINK_WRITTEN` | Sink | traceId, targetMsgId, writeTimestamp, latencyMs | 消息写入目标集群成功 |
 | `FAILED` | Source/Sink | traceId, failStage, errorReason, failTimestamp | 任意环节处理失败 |
 
+#### TraceCollector 组件详细设计
+
+> **对应需求**：需求 19 §1-6
+
+##### 组件职责
+
+`TraceCollector` 是全链路 Trace 的核心组件，负责 Trace 事件的采集、存储、延迟计算和指标聚合。Source Worker 和 Sink Worker 各持有独立的 `TraceCollector` 实例。
+
+##### 核心类设计
+
+```java
+/**
+ * 全链路 Trace 采集器
+ * - Source 侧：记录 SOURCE_PARSED 和 FAILED 事件
+ * - Sink 侧：记录 SINK_WRITTEN 和 FAILED 事件，计算端到端延迟
+ * 
+ * 线程安全：内部使用 ConcurrentLinkedDeque 存储事件，滑动窗口使用 ReentrantLock
+ */
+public class TraceCollector {
+    
+    /** Trace 事件环形缓冲区（内存中最多保留最近 10000 条事件） */
+    private final ConcurrentLinkedDeque<TraceEvent> eventBuffer;
+    private static final int MAX_BUFFER_SIZE = 10_000;
+    
+    /** 延迟计算滑动窗口（1 分钟） */
+    private final SlidingWindowLatencyCalculator latencyCalculator;
+    
+    /** TPS 计算滑动窗口（1 秒） */
+    private final SlidingWindowCounter tpsCounter;
+    
+    /** Trace 日志文件输出（异步写入） */
+    private final TraceLogWriter traceLogWriter;
+    
+    /**
+     * 记录 SOURCE_PARSED 事件（需求 19 §3）
+     * 由 CommitLogParser 在消息解析成功后调用
+     */
+    public void logSourceParsed(String traceId, long masterPhyOffset,
+            String topic, int msgSize, long parseTimestamp) {
+        TraceEvent event = new TraceEvent();
+        event.setType(TraceEventType.SOURCE_PARSED);
+        event.setTraceId(traceId);
+        event.setMasterPhyOffset(masterPhyOffset);
+        event.setTopic(topic);
+        event.setMsgSize(msgSize);
+        event.setTimestamp(parseTimestamp);
+        
+        addEvent(event);
+        tpsCounter.increment();
+    }
+    
+    /**
+     * 记录 SINK_WRITTEN 事件（需求 19 §4）
+     * 由 RocketMQSink 在消息写入目标集群成功后调用
+     * latencyMs = writeTimestamp - receiveTimestamp（端到端延迟）
+     */
+    public void logSinkWritten(String traceId, String targetMsgId,
+            long writeTimestamp, long latencyMs) {
+        TraceEvent event = new TraceEvent();
+        event.setType(TraceEventType.SINK_WRITTEN);
+        event.setTraceId(traceId);
+        event.setTargetMsgId(targetMsgId);
+        event.setTimestamp(writeTimestamp);
+        event.setLatencyMs(latencyMs);
+        
+        addEvent(event);
+        latencyCalculator.record(latencyMs);
+        tpsCounter.increment();
+    }
+    
+    /**
+     * 记录 FAILED 事件（需求 19 §5）
+     * 由 CommitLogParser 或 RocketMQSink 在处理失败时调用
+     */
+    public void logFailed(String traceId, String failStage,
+            String errorReason, long failTimestamp) {
+        TraceEvent event = new TraceEvent();
+        event.setType(TraceEventType.FAILED);
+        event.setTraceId(traceId);
+        event.setFailStage(failStage);
+        event.setErrorReason(errorReason);
+        event.setTimestamp(failTimestamp);
+        
+        addEvent(event);
+    }
+    
+    /**
+     * 获取 Trace 相关指标（需求 19 §6）
+     */
+    public double getAvgEndToEndLatencyMs() {
+        return latencyCalculator.getAverage();
+    }
+    
+    public double getP99EndToEndLatencyMs() {
+        return latencyCalculator.getP99();
+    }
+    
+    public long getCurrentTps() {
+        return tpsCounter.getCount();
+    }
+    
+    private void addEvent(TraceEvent event) {
+        eventBuffer.addLast(event);
+        // 超出容量时淘汰最老的事件
+        while (eventBuffer.size() > MAX_BUFFER_SIZE) {
+            eventBuffer.pollFirst();
+        }
+        // 异步写入 Trace 日志文件
+        traceLogWriter.asyncWrite(event);
+    }
+}
+```
+
+##### TraceEvent 数据模型
+
+```java
+/**
+ * Trace 事件数据模型
+ */
+public class TraceEvent {
+    private TraceEventType type;      // SOURCE_PARSED / SINK_WRITTEN / FAILED
+    private String traceId;           // {nodeId}-{masterPhyOffset}-{offsetInPacket}
+    private long masterPhyOffset;     // 数据包起始偏移量
+    private String topic;             // 消息 Topic
+    private int msgSize;              // 消息大小（字节）
+    private String targetMsgId;       // 目标集群返回的 msgId（仅 SINK_WRITTEN）
+    private long latencyMs;           // 端到端延迟（仅 SINK_WRITTEN）
+    private String failStage;         // 失败阶段：SOURCE / SINK（仅 FAILED）
+    private String errorReason;       // 失败原因（仅 FAILED）
+    private long timestamp;           // 事件时间戳
+}
+
+public enum TraceEventType {
+    SOURCE_PARSED,
+    SINK_WRITTEN,
+    FAILED
+}
+```
+
+##### 滑动窗口延迟计算器
+
+```java
+/**
+ * 基于时间桶的滑动窗口延迟计算器
+ * 用于计算 avgEndToEndLatencyMs 和 p99EndToEndLatencyMs（需求 19 §6）
+ * 
+ * 设计思路：
+ * - 窗口大小：1 分钟（60 个 1 秒时间桶）
+ * - 每个时间桶存储该秒内所有延迟样本
+ * - 查询时聚合所有有效桶内的样本进行计算
+ * - 使用 T-Digest 近似算法计算 P99，避免存储全量样本
+ */
+public class SlidingWindowLatencyCalculator {
+    
+    /** 窗口大小（秒） */
+    private static final int WINDOW_SIZE_SECONDS = 60;
+    
+    /** 时间桶数组（环形缓冲） */
+    private final LatencyBucket[] buckets = new LatencyBucket[WINDOW_SIZE_SECONDS];
+    
+    /** 每个时间桶的数据结构 */
+    private static class LatencyBucket {
+        long timestampSecond;           // 该桶对应的时间（秒）
+        long totalLatency;              // 累计延迟总和
+        long count;                     // 样本数
+        long maxLatency;                // 最大延迟
+        long[] percentileSamples;       // P99 采样（蓄水池采样，最多 1000 个）
+        int sampleCount;                // 实际采样数
+    }
+    
+    /**
+     * 记录一个延迟样本
+     * 时间复杂度：O(1)
+     */
+    public void record(long latencyMs) {
+        int bucketIndex = (int)(System.currentTimeMillis() / 1000 % WINDOW_SIZE_SECONDS);
+        LatencyBucket bucket = getOrCreateBucket(bucketIndex);
+        
+        synchronized (bucket) {
+            bucket.totalLatency += latencyMs;
+            bucket.count++;
+            bucket.maxLatency = Math.max(bucket.maxLatency, latencyMs);
+            
+            // 蓄水池采样（Reservoir Sampling）用于 P99 计算
+            if (bucket.sampleCount < 1000) {
+                bucket.percentileSamples[bucket.sampleCount++] = latencyMs;
+            } else {
+                int r = ThreadLocalRandom.current().nextInt((int) bucket.count);
+                if (r < 1000) {
+                    bucket.percentileSamples[r] = latencyMs;
+                }
+            }
+        }
+    }
+    
+    /**
+     * 计算窗口内平均延迟
+     * 时间复杂度：O(WINDOW_SIZE_SECONDS)
+     */
+    public double getAverage() {
+        long now = System.currentTimeMillis() / 1000;
+        long totalLatency = 0, totalCount = 0;
+        
+        for (LatencyBucket bucket : buckets) {
+            if (bucket != null && now - bucket.timestampSecond < WINDOW_SIZE_SECONDS) {
+                totalLatency += bucket.totalLatency;
+                totalCount += bucket.count;
+            }
+        }
+        
+        return totalCount > 0 ? (double) totalLatency / totalCount : 0.0;
+    }
+    
+    /**
+     * 计算窗口内 P99 延迟
+     * 合并所有有效桶的采样数据，排序后取第 99 百分位
+     * 时间复杂度：O(N * log(N))，N 为总采样数（最多 60 * 1000 = 60000）
+     */
+    public double getP99() {
+        long now = System.currentTimeMillis() / 1000;
+        LongArrayList allSamples = new LongArrayList();
+        
+        for (LatencyBucket bucket : buckets) {
+            if (bucket != null && now - bucket.timestampSecond < WINDOW_SIZE_SECONDS) {
+                for (int i = 0; i < bucket.sampleCount; i++) {
+                    allSamples.add(bucket.percentileSamples[i]);
+                }
+            }
+        }
+        
+        if (allSamples.isEmpty()) return 0.0;
+        
+        long[] sorted = allSamples.toLongArray();
+        Arrays.sort(sorted);
+        int p99Index = (int) Math.ceil(sorted.length * 0.99) - 1;
+        return sorted[Math.max(0, p99Index)];
+    }
+}
+```
+
+##### Trace 日志写入器
+
+```java
+/**
+ * Trace 事件异步日志写入
+ * - 写入独立的 Trace 日志文件（trace.log）
+ * - 使用异步队列 + 后台线程写入，不阻塞业务线程
+ * - 日志格式为 JSON Lines（每行一条 Trace 事件）
+ * - 支持日志轮转（按大小，默认 100MB/文件，保留最近 10 个）
+ */
+public class TraceLogWriter {
+    
+    private final BlockingQueue<TraceEvent> writeQueue;
+    private final Path traceLogDir;
+    private final Thread writerThread;
+    
+    /** 日志配置 */
+    private static final long MAX_FILE_SIZE = 100 * 1024 * 1024;  // 100MB
+    private static final int MAX_FILE_COUNT = 10;                   // 保留 10 个文件
+    
+    /**
+     * 异步写入 Trace 事件到日志文件
+     * 使用 offer（非阻塞），队列满时丢弃最老的事件
+     */
+    public void asyncWrite(TraceEvent event) {
+        if (!writeQueue.offer(event)) {
+            writeQueue.poll();       // 丢弃最老的
+            writeQueue.offer(event); // 重新入队
+        }
+    }
+    
+    /**
+     * 后台写入线程
+     * 批量取出事件（最多 100 条/批），减少文件 IO 次数
+     */
+    private void writerLoop() {
+        List<TraceEvent> batch = new ArrayList<>(100);
+        while (!Thread.currentThread().isInterrupted()) {
+            batch.clear();
+            writeQueue.drainTo(batch, 100);
+            if (batch.isEmpty()) {
+                // 空闲时等待 50ms
+                LockSupport.parkNanos(50_000_000);
+                continue;
+            }
+            writeBatch(batch);
+        }
+    }
+    
+    /**
+     * Trace 日志输出格式（JSON Lines）
+     * 
+     * SOURCE_PARSED:
+     * {"type":"SOURCE_PARSED","traceId":"node1-12345-0","topic":"TopicA",
+     *  "msgSize":1024,"masterPhyOffset":12345,"timestamp":1710000000000}
+     * 
+     * SINK_WRITTEN:
+     * {"type":"SINK_WRITTEN","traceId":"node1-12345-0","targetMsgId":"AC110001...",
+     *  "latencyMs":45,"timestamp":1710000000045}
+     * 
+     * FAILED:
+     * {"type":"FAILED","traceId":"node1-12345-0","failStage":"SOURCE",
+     *  "errorReason":"INVALID_MAGIC_CODE","timestamp":1710000000000}
+     */
+    private void writeBatch(List<TraceEvent> batch) {
+        // 追加写入当前 trace.log 文件
+        // 文件超过 MAX_FILE_SIZE 时自动轮转
+    }
+}
+```
+
+##### Trace 数据流图
+
+```
+CommitLogParser                              RocketMQSink
+  │                                            │
+  ├─ 解析成功                                   ├─ 写入成功
+  │  │                                         │  │
+  │  ▼                                         │  ▼
+  │  TraceCollector                             │  TraceCollector
+  │  .logSourceParsed()                        │  .logSinkWritten()
+  │  │                                         │  │
+  │  ├─► eventBuffer（环形缓冲，10000 条）      │  ├─► eventBuffer
+  │  ├─► tpsCounter.increment()                │  ├─► latencyCalculator.record()
+  │  └─► traceLogWriter.asyncWrite()           │  ├─► tpsCounter.increment()
+  │                                            │  └─► traceLogWriter.asyncWrite()
+  │                                            │
+  ├─ 解析失败                                   ├─ 写入失败
+  │  │                                         │  │
+  │  ▼                                         │  ▼
+  │  TraceCollector                             │  TraceCollector
+  │  .logFailed("SOURCE", ...)                 │  .logFailed("SINK", ...)
+  │                                            │
+  └──────────────┬─────────────────────────────┘
+                 │
+                 ▼
+        MetricsCollector 读取
+        ├─ avgEndToEndLatencyMs ← latencyCalculator.getAverage()
+        ├─ p99EndToEndLatencyMs ← latencyCalculator.getP99()
+        └─ currentTps           ← tpsCounter.getCount()
+                 │
+                 ▼
+        GET /metrics 接口暴露
+        每 10 秒日志打印
+```
+
 ### 8.7 定期日志输出
 
 > **对应需求**：需求 20 §4
@@ -2232,6 +2586,339 @@ public class MetricsHttpServer {
 | `/metrics` | GET | `{ "source": {...}, "pipeline": {...} }` | `{ "sink": {...} }` |
 | `/health` | GET | `{ "status": "UP", "role": "source", ... }` | `{ "status": "UP", "role": "sink", ... }` |
 | `/resume` | POST | 触发 PARSE_ERROR_SUSPENDED 恢复 | 触发 TOPIC_SYNC_SUSPENDED 恢复 |
+
+#### 8.8.3 滑动窗口指标计算实现
+
+> **对应需求**：需求 20（syncBytesPerSecond、currentTps）、需求 19 §6（avgEndToEndLatencyMs、p99EndToEndLatencyMs）
+
+部分 Pipeline 和 Trace 指标属于**速率型/分位数型指标**，不能简单用计数器实现，需要使用**滑动窗口算法**来保证计算的实时性和准确性。
+
+##### 8.8.3.1 核心数据结构：SlidingWindowCounter
+
+```java
+/**
+ * 基于环形数组的滑动窗口计数器
+ * 
+ * 设计目标：
+ *   - O(1) 时间复杂度的 record 和 getRate 操作
+ *   - 固定内存开销，不随数据量增长
+ *   - 线程安全，无锁设计（CAS + volatile）
+ * 
+ * 原理：
+ *   将时间轴按 bucketDurationMs 分割为固定数量的桶（bucket），
+ *   每个桶记录该时间段内的累加值。查询时汇总窗口内所有有效桶的值。
+ *
+ * 适用指标：syncBytesPerSecond、currentTps
+ */
+public class SlidingWindowCounter {
+    /** 桶数组（环形缓冲区） */
+    private final AtomicLong[] buckets;
+    /** 每个桶的时间跨度（毫秒） */
+    private final long bucketDurationMs;
+    /** 桶的数量 */
+    private final int bucketCount;
+    /** 总窗口时长 = bucketCount × bucketDurationMs */
+    private final long windowDurationMs;
+    /** 每个桶对应的时间戳（用于判断桶是否过期） */
+    private final AtomicLong[] bucketTimestamps;
+    
+    /**
+     * @param windowDurationMs 总窗口时长（如 1000ms = 1秒窗口）
+     * @param bucketCount      桶数量（如 10 个桶，每桶 100ms）
+     */
+    public SlidingWindowCounter(long windowDurationMs, int bucketCount) {
+        this.windowDurationMs = windowDurationMs;
+        this.bucketCount = bucketCount;
+        this.bucketDurationMs = windowDurationMs / bucketCount;
+        this.buckets = new AtomicLong[bucketCount];
+        this.bucketTimestamps = new AtomicLong[bucketCount];
+        for (int i = 0; i < bucketCount; i++) {
+            buckets[i] = new AtomicLong(0);
+            bucketTimestamps[i] = new AtomicLong(0);
+        }
+    }
+    
+    /**
+     * 记录一个值到当前时间对应的桶
+     * 线程安全，使用 CAS 操作
+     */
+    public void record(long value) {
+        long now = System.currentTimeMillis();
+        int index = (int) ((now / bucketDurationMs) % bucketCount);
+        long bucketStart = (now / bucketDurationMs) * bucketDurationMs;
+        
+        // 如果桶已过期（属于上一轮），重置
+        if (bucketTimestamps[index].get() != bucketStart) {
+            buckets[index].set(value);
+            bucketTimestamps[index].set(bucketStart);
+        } else {
+            buckets[index].addAndGet(value);
+        }
+    }
+    
+    /**
+     * 获取窗口内的累加总量
+     */
+    public long getWindowTotal() {
+        long now = System.currentTimeMillis();
+        long windowStart = now - windowDurationMs;
+        long total = 0;
+        
+        for (int i = 0; i < bucketCount; i++) {
+            if (bucketTimestamps[i].get() >= windowStart) {
+                total += buckets[i].get();
+            }
+        }
+        return total;
+    }
+    
+    /**
+     * 获取每秒速率 = 窗口总量 / 窗口时长（秒）
+     */
+    public double getRate() {
+        return getWindowTotal() * 1000.0 / windowDurationMs;
+    }
+}
+```
+
+**内存开销分析**：
+- 每个 SlidingWindowCounter 实例：`bucketCount × 16 字节`（AtomicLong × 2）
+- 10 个桶 × 16B = 160B / 指标，极低内存开销
+
+##### 8.8.3.2 核心数据结构：SlidingWindowLatency
+
+```java
+/**
+ * 基于环形数组 + 排序的滑动窗口延迟统计器
+ * 
+ * 设计目标：
+ *   - 计算滑动窗口内的 avg / p99 分位数
+ *   - 固定内存上限，防止高 TPS 下内存溢出
+ *   - 线程安全
+ * 
+ * 原理：
+ *   将窗口分为多个桶，每个桶内维护一个固定容量的采样数组（reservoir sampling）。
+ *   查询 p99 时，合并所有有效桶的采样值进行排序计算。
+ *
+ * 适用指标：avgEndToEndLatencyMs、p99EndToEndLatencyMs
+ */
+public class SlidingWindowLatency {
+    /** 桶数组 */
+    private final LatencyBucket[] buckets;
+    /** 每个桶的时间跨度 */
+    private final long bucketDurationMs;
+    /** 桶数量 */
+    private final int bucketCount;
+    /** 总窗口时长（默认 60000ms = 1 分钟） */
+    private final long windowDurationMs;
+    
+    /**
+     * @param windowDurationMs 窗口时长（如 60000ms = 1 分钟）
+     * @param bucketCount      桶数量（如 60 个桶，每桶 1 秒）
+     * @param samplesPerBucket 每桶最大采样数（如 1000，防止内存溢出）
+     */
+    public SlidingWindowLatency(long windowDurationMs, int bucketCount, 
+                                 int samplesPerBucket) {
+        this.windowDurationMs = windowDurationMs;
+        this.bucketCount = bucketCount;
+        this.bucketDurationMs = windowDurationMs / bucketCount;
+        this.buckets = new LatencyBucket[bucketCount];
+        for (int i = 0; i < bucketCount; i++) {
+            buckets[i] = new LatencyBucket(samplesPerBucket);
+        }
+    }
+    
+    /**
+     * 记录一次延迟采样
+     */
+    public void record(long latencyMs) {
+        long now = System.currentTimeMillis();
+        int index = (int) ((now / bucketDurationMs) % bucketCount);
+        long bucketStart = (now / bucketDurationMs) * bucketDurationMs;
+        buckets[index].add(latencyMs, bucketStart);
+    }
+    
+    /**
+     * 计算窗口内平均延迟
+     */
+    public double getAvgLatency() {
+        long[] samples = collectValidSamples();
+        if (samples.length == 0) return 0;
+        return Arrays.stream(samples).average().orElse(0);
+    }
+    
+    /**
+     * 计算窗口内 P99 延迟
+     * 算法：收集所有有效桶的采样值 → 排序 → 取第 99% 位置的值
+     */
+    public long getP99Latency() {
+        long[] samples = collectValidSamples();
+        if (samples.length == 0) return 0;
+        Arrays.sort(samples);
+        int index = (int) Math.ceil(samples.length * 0.99) - 1;
+        return samples[Math.max(0, index)];
+    }
+    
+    /**
+     * 收集窗口内所有有效桶的采样值
+     */
+    private long[] collectValidSamples() {
+        long now = System.currentTimeMillis();
+        long windowStart = now - windowDurationMs;
+        List<long[]> allSamples = new ArrayList<>();
+        
+        for (int i = 0; i < bucketCount; i++) {
+            if (buckets[i].getTimestamp() >= windowStart) {
+                allSamples.add(buckets[i].getSamples());
+            }
+        }
+        
+        return allSamples.stream()
+            .flatMapToLong(Arrays::stream)
+            .toArray();
+    }
+}
+
+/**
+ * 单个延迟桶 — 蓄水池采样（Reservoir Sampling）
+ * 当桶内样本数超过 maxSamples 时，按概率替换，保证统计均匀性
+ */
+class LatencyBucket {
+    private final long[] samples;
+    private final int maxSamples;
+    private final AtomicInteger count = new AtomicInteger(0);
+    private volatile long timestamp;
+    private final ThreadLocalRandom random = ThreadLocalRandom.current();
+    
+    public LatencyBucket(int maxSamples) {
+        this.maxSamples = maxSamples;
+        this.samples = new long[maxSamples];
+    }
+    
+    /**
+     * 蓄水池采样：
+     *   - 前 maxSamples 个样本直接存入
+     *   - 后续样本以 maxSamples/n 的概率替换已有样本
+     *   - 保证每个样本被选中的概率相等
+     */
+    public synchronized void add(long latency, long bucketStart) {
+        if (this.timestamp != bucketStart) {
+            // 新的时间桶，重置
+            count.set(0);
+            this.timestamp = bucketStart;
+        }
+        
+        int n = count.incrementAndGet();
+        if (n <= maxSamples) {
+            samples[n - 1] = latency;
+        } else {
+            // 蓄水池采样：以 maxSamples/n 的概率替换
+            int replaceIndex = random.nextInt(n);
+            if (replaceIndex < maxSamples) {
+                samples[replaceIndex] = latency;
+            }
+        }
+    }
+    
+    public long getTimestamp() { return timestamp; }
+    
+    public long[] getSamples() {
+        int size = Math.min(count.get(), maxSamples);
+        return Arrays.copyOf(samples, size);
+    }
+}
+```
+
+**内存开销分析**：
+- 60 个桶 × 1000 采样 × 8B（long） = **约 480KB**
+- 即使 TPS 达到 50,000，每秒采样 1000 个，内存恒定不增长
+
+##### 8.8.3.3 指标与数据结构映射
+
+| 指标名称 | 数据结构 | 窗口大小 | 桶数 | 桶采样上限 | 计算方式 |
+|---------|---------|---------|------|-----------|---------|
+| `syncBytesPerSecond` | `SlidingWindowCounter` | 1s | 10 | — | `getRate()`（字节/秒） |
+| `currentTps` | `SlidingWindowCounter` | 1s | 10 | — | `getRate()`（条/秒） |
+| `avgEndToEndLatencyMs` | `SlidingWindowLatency` | 60s | 60 | 1000 | `getAvgLatency()`（毫秒） |
+| `p99EndToEndLatencyMs` | `SlidingWindowLatency` | 60s | 60 | 1000 | `getP99Latency()`（毫秒） |
+
+##### 8.8.3.4 MetricsCollector 中的集成
+
+```java
+public class MetricsCollector {
+    // ========== 速率型指标（滑动窗口） ==========
+    
+    /** 每秒同步字节数 — 1 秒窗口，10 个桶 */
+    private final SlidingWindowCounter bytesPerSecondCounter = 
+        new SlidingWindowCounter(1000, 10);
+    
+    /** 当前 TPS — 1 秒窗口，10 个桶 */
+    private final SlidingWindowCounter tpsCounter = 
+        new SlidingWindowCounter(1000, 10);
+    
+    /** 端到端延迟统计 — 1 分钟窗口，60 个桶，每桶最多 1000 采样 */
+    private final SlidingWindowLatency latencyStats = 
+        new SlidingWindowLatency(60000, 60, 1000);
+    
+    // ========== 记录方法 ==========
+    
+    /** Sink 写入成功时调用 */
+    public void recordSyncSuccess(int msgSize, long endToEndLatencyMs) {
+        syncSuccessCount.incrementAndGet();
+        bytesPerSecondCounter.record(msgSize);
+        tpsCounter.record(1);
+        latencyStats.record(endToEndLatencyMs);
+    }
+    
+    // ========== 快照方法 ==========
+    
+    @Override
+    public Map<String, Object> getPipelineMetrics() {
+        Map<String, Object> metrics = new LinkedHashMap<>();
+        // ... 其他 Pipeline 指标 ...
+        
+        // 滑动窗口指标
+        metrics.put("syncBytesPerSecond", 
+            (long) bytesPerSecondCounter.getRate());
+        metrics.put("currentTps", 
+            (long) tpsCounter.getRate());
+        metrics.put("avgEndToEndLatencyMs", 
+            (long) latencyStats.getAvgLatency());
+        metrics.put("p99EndToEndLatencyMs", 
+            latencyStats.getP99Latency());
+        
+        return metrics;
+    }
+}
+```
+
+##### 8.8.3.5 指标数据流图
+
+```
+消息写入成功
+    │
+    ├──► bytesPerSecondCounter.record(msgSize)
+    │        └─► SlidingWindowCounter [1s窗口, 10桶]
+    │              └─► getRate() → syncBytesPerSecond
+    │
+    ├──► tpsCounter.record(1)
+    │        └─► SlidingWindowCounter [1s窗口, 10桶]
+    │              └─► getRate() → currentTps
+    │
+    └──► latencyStats.record(endToEndLatencyMs)
+             └─► SlidingWindowLatency [60s窗口, 60桶, 1000采样/桶]
+                   ├─► getAvgLatency() → avgEndToEndLatencyMs
+                   └─► getP99Latency() → p99EndToEndLatencyMs
+
+定时任务 (每10秒)
+    └──► MetricsCollector.getPipelineMetrics()
+           └─► 汇总上述所有指标 → JSON 日志输出 + /metrics 接口
+
+总内存开销：
+  SlidingWindowCounter × 2 = 320B
+  SlidingWindowLatency × 1 = ~480KB
+  合计：< 500KB（固定，不随 TPS 增长）
+```
 
 ---
 
@@ -2328,7 +3015,7 @@ if (queue.size() > queueCapacity * 0.8) {
 ```java
 /**
  * 通过工厂方法注入不同的 SyncSink 实现（需求 2 §6）
- * 无需修改 HASource 或 SyncPipeline 的代码
+ * 无需修改 HASource 或 SourceBootstrap 的代码
  */
 public interface SyncSinkFactory {
     SyncSink createSink(SinkConfig config);
@@ -2356,36 +3043,428 @@ public class ElasticsearchSink implements SyncSink {
 ### 11.2 插件化架构预留
 
 ```java
-// 在 SyncPipeline 中支持多个 Sink 链式处理
-public class SyncPipeline {
-    private final List<SyncSink> sinks;
+// 在 HASource 中支持多个 Sink 通过 ZMQ 并行拉取
+// 每个 Sink 独立发送 PullRequest，Source 按 offset 返回数据
+// 无需 SyncPipeline 中转，Sink 扩缩容完全动态
+```
+
+### 11.3 分布式负载均衡详细设计
+
+> **对应需求**：需求 18（分布式负载均衡）
+
+#### 11.3.1 Source 单节点运行 — 分布式锁设计
+
+> **对应需求**：需求 18 §1-2
+
+**设计目标**：确保同一时刻只有一个 Source 节点处于活跃状态，故障后在其他节点自动重启并断点续传。
+
+**锁选型**：支持两种分布式锁实现，通过配置项 `--lockProvider` 选择（默认 `nameserver-kv`）：
+
+| 锁实现 | 配置值 | 适用场景 | 优点 | 缺点 |
+|--------|--------|---------|------|------|
+| **NameServer KV 锁** | `nameserver-kv` | 默认方案，无额外依赖 | 零依赖，复用已有 NameServer | 非强一致，依赖 TTL 过期 |
+| **ZooKeeper 临时节点锁** | `zookeeper` | 强一致性要求 | 强一致、自动释放 | 需要额外部署 ZooKeeper |
+
+**方案一：NameServer KV 锁（默认方案）**
+
+```java
+/**
+ * 基于 NameServer KV 实现的分布式锁
+ * 原理：利用 NameServer KV 的 PUT_KV_CONFIG_UNIQUE 语义（CAS 操作）
+ *       + TTL 过期机制实现互斥锁
+ */
+public class NameServerKVLock implements DistributedLock {
+    private static final String NAMESPACE = "SYNC_SOURCE_LOCK";
+    private static final long LOCK_TTL_MS = 30_000;      // 锁 TTL 30 秒
+    private static final long RENEW_INTERVAL_MS = 10_000; // 续约间隔 10 秒
     
-    public void addSink(SyncSink sink) {
-        this.sinks.add(sink);
+    private final MQClientAPIImpl mqClientAPI;
+    private final String lockKey;      // 格式: {brokerName}:source:lock
+    private final String lockValue;    // 格式: {nodeId}:{timestamp}
+    private ScheduledFuture<?> renewTask;
+    
+    /**
+     * 尝试获取锁
+     * 1. 读取当前锁值
+     * 2. 如果锁不存在 → CAS 写入自身信息
+     * 3. 如果锁存在但 TTL 已过期 → CAS 覆盖写入
+     * 4. 如果锁存在且未过期 → 获取失败
+     */
+    @Override
+    public boolean tryLock() {
+        String currentLock = mqClientAPI.getKVConfig(NAMESPACE, lockKey);
+        
+        if (currentLock == null || isExpired(currentLock)) {
+            // CAS 写入锁
+            boolean success = mqClientAPI.putKVConfigIfAbsent(
+                NAMESPACE, lockKey, lockValue);
+            if (success) {
+                startRenewTask();
+                return true;
+            }
+        }
+        return false;
     }
     
-    private void dispatch(SyncRecord record) {
-        for (SyncSink sink : sinks) {
-            sink.write(record);
+    /**
+     * 定期续约（每 10 秒更新锁的 timestamp，防止 TTL 过期）
+     */
+    private void startRenewTask() {
+        renewTask = scheduler.scheduleAtFixedRate(() -> {
+            String renewValue = nodeId + ":" + System.currentTimeMillis();
+            mqClientAPI.putKVConfig(NAMESPACE, lockKey, renewValue);
+        }, RENEW_INTERVAL_MS, RENEW_INTERVAL_MS, TimeUnit.MILLISECONDS);
+    }
+    
+    @Override
+    public void unlock() {
+        renewTask.cancel(false);
+        mqClientAPI.deleteKVConfig(NAMESPACE, lockKey);
+    }
+}
+```
+
+**NameServer KV 锁数据模型**：
+
+```
+Namespace: SYNC_SOURCE_LOCK
+├── Key: {brokerName}:source:lock
+└── Value: {nodeId}:{timestamp}    // 持有者标识 + 最后续约时间
+                                    // 当 currentTime - timestamp > TTL 时视为过期
+```
+
+**方案二：ZooKeeper 临时节点锁**
+
+```java
+/**
+ * 基于 ZooKeeper 临时节点实现的分布式锁
+ * 原理：利用 ZooKeeper 临时有序节点 + Watcher 实现互斥锁
+ *       节点会话断开时自动释放锁
+ */
+public class ZookeeperLock implements DistributedLock {
+    private static final String LOCK_PATH = "/ha-sync/source-lock";
+    
+    private final CuratorFramework zkClient;
+    private final InterProcessMutex mutex;
+    private final String nodeId;
+    
+    public ZookeeperLock(String zkAddr, String brokerName, String nodeId) {
+        this.zkClient = CuratorFrameworkFactory.newClient(
+            zkAddr, new ExponentialBackoffRetry(1000, 3));
+        this.mutex = new InterProcessMutex(zkClient, 
+            LOCK_PATH + "/" + brokerName);
+        this.nodeId = nodeId;
+    }
+    
+    @Override
+    public boolean tryLock() {
+        try {
+            return mutex.acquire(5, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            log.warn("ZooKeeper 锁获取失败", e);
+            return false;
+        }
+    }
+    
+    @Override
+    public void unlock() {
+        try {
+            mutex.release();
+        } catch (Exception e) {
+            log.warn("ZooKeeper 锁释放异常", e);
         }
     }
 }
 ```
 
-### 11.3 分布式负载均衡扩展
+**锁相关配置参数（新增到 SourceConfig）**：
 
-> **对应需求**：需求 18
+| 参数 | 环境变量 | 默认值 | 说明 |
+|------|---------|--------|------|
+| `--lockProvider` | `HA_SOURCE_LOCK_PROVIDER` | `nameserver-kv` | 分布式锁实现：`nameserver-kv` / `zookeeper` |
+| `--zkAddr` | `HA_SOURCE_ZK_ADDR` | — | ZooKeeper 地址（仅 `zookeeper` 模式需要） |
+| `--lockTtlMs` | `HA_SOURCE_LOCK_TTL_MS` | `30000` | 锁 TTL（仅 `nameserver-kv` 模式） |
+| `--lockRenewIntervalMs` | `HA_SOURCE_LOCK_RENEW_INTERVAL_MS` | `10000` | 锁续约间隔 |
+
+#### 11.3.2 Source 故障转移流程
+
+> **对应需求**：需求 18 §2
 
 ```
-Source 单节点保证：
-  - 分布式锁（ZooKeeper / Redis）确保同一时刻只有一个 Source 活跃
-  - 故障后其他节点可重启 Source，从 Checkpoint 断点续传
+┌──────────────────────────────────────────────────────────────────┐
+│                    Source 故障转移流程                             │
+└──────────────────────────────────────────────────────────────────┘
 
-Sink 分布式扩展：
-  - 多个 Sink 并行工作
-  - 按 Source 统计的 topicBytesStats 负载均衡
-  - 偏差不超过 10%
-  - 节点数变化自动重新计算，无需重启 Source
+ 正常运行状态：
+   Source-A 持有分布式锁，定期续约（每 10s）
+   Source-B 处于备用状态，定期尝试获取锁（每 5s）
+
+ 故障发生：
+   Source-A 宕机 → 锁续约停止 → TTL 过期（30s 后锁自动释放）
+   （ZooKeeper 模式：会话断开 → 临时节点自动删除 → 锁立即释放）
+
+ 故障转移：
+   1. Source-B 尝试获取锁 → 成功
+   2. Source-B 从 NameServer KV 读取 globalCheckpoint
+   3. Source-B 注册自身 ZMQ 地址到 NameServer KV（覆盖 Source-A 的旧地址）
+   4. Source-B 连接 Master，从 globalCheckpoint 断点续传
+   5. Sink 通过 NameServer KV 感知 Source 地址变更，自动重连新 Source
+
+ 故障恢复时间：
+   - NameServer KV 模式：锁 TTL（30s）+ 探测间隔（5s）= 最长 35s
+   - ZooKeeper 模式：会话超时（10s）+ 探测间隔（5s）= 最长 15s
+```
+
+```mermaid
+sequenceDiagram
+    participant A as Source-A（活跃）
+    participant B as Source-B（备用）
+    participant Lock as 分布式锁
+    participant NS as NameServer KV
+    participant Master as Master Broker
+
+    Note over A: 正常运行，持有锁
+    A->>Lock: 续约（每 10s）
+    A->>NS: 刷新 ZMQ 地址（每 30s）
+    
+    Note over A: ⚡ Source-A 宕机
+    A--xLock: 续约停止
+    
+    B->>Lock: 尝试获取锁（每 5s）
+    Note over Lock: TTL 30s 过期
+    Lock-->>B: 获取锁成功
+    
+    B->>NS: 读取 globalCheckpoint
+    NS-->>B: checkpoint = 1234567890
+    
+    B->>NS: 注册 ZMQ 地址（覆盖 Source-A）
+    B->>Master: TCP 连接，上报 slaveMaxOffset = 1234567890
+    Master-->>B: 从断点继续推送数据
+    
+    Note over B: Source-B 成为活跃节点
+```
+
+#### 11.3.3 Sink 分布式负载均衡算法
+
+> **对应需求**：需求 18 §6-8
+
+**设计目标**：Sink 根据 Source 统计的各 Topic 流量占比，将消息均匀分配到多个 Sink 节点处理，各节点负载偏差不超过 10%。
+
+**流量统计获取方式**：
+
+Sink 通过两种途径获取 `topicBytesStats`：
+1. **ZMQ PullResponse 附带**：每次 PullResponse 中包含最新的 `topicBytesStats` 快照
+2. **NameServer KV 读取**：定期（每 30s）从 NameServer KV 读取 Source 发布的统计数据
+
+```
+Namespace: SYNC_CHECKPOINT
+Key: {brokerName}:source:topicStats
+Value: TopicA:102400000,TopicB:51200000,TopicC:25600000
+```
+
+**负载均衡算法 — 基于流量权重的一致性哈希**：
+
+```java
+/**
+ * 分布式 Sink 负载均衡器
+ * 算法：基于 Topic 流量权重的确定性分配
+ * 
+ * 分配规则：
+ * 1. 计算各 Topic 的流量占比（bytesPercent）
+ * 2. 将 Topic 按流量从大到小排序
+ * 3. 贪心算法：依次将 Topic 分配给当前负载最轻的 Sink 节点
+ * 4. 保证各节点负载偏差 ≤ 10%
+ */
+public class DistributedLoadBalancer {
+    
+    /** 
+     * 活跃 Sink 节点列表（从 NameServer KV 中发现）
+     * Namespace: SYNC_SINK_REGISTRY
+     * Key: {brokerName}:sink:{sinkId}:heartbeat
+     * Value: {timestamp}
+     */
+    private final List<String> activeSinkIds;
+    
+    /** 各 Sink 节点负责的 Topic 集合 */
+    private final Map<String, Set<String>> sinkTopicAssignment;
+    
+    /**
+     * 计算 Topic → Sink 分配映射
+     * 
+     * @param topicBytesStats 各 Topic 累计字节数
+     * @param sinkIds 活跃 Sink 节点列表
+     * @return Topic → sinkId 的映射
+     */
+    public Map<String, String> calculateAssignment(
+            Map<String, Long> topicBytesStats, List<String> sinkIds) {
+        
+        if (sinkIds.size() <= 1) {
+            // 单 Sink 模式，所有 Topic 分配给唯一 Sink
+            return topicBytesStats.keySet().stream()
+                .collect(Collectors.toMap(t -> t, t -> sinkIds.get(0)));
+        }
+        
+        // 1. 按流量从大到小排序
+        List<Map.Entry<String, Long>> sortedTopics = topicBytesStats.entrySet()
+            .stream()
+            .sorted(Map.Entry.<String, Long>comparingByValue().reversed())
+            .collect(Collectors.toList());
+        
+        // 2. 初始化各 Sink 的累计负载
+        Map<String, Long> sinkLoad = new LinkedHashMap<>();
+        for (String sinkId : sinkIds) {
+            sinkLoad.put(sinkId, 0L);
+        }
+        
+        // 3. 贪心分配：将每个 Topic 分配给当前负载最轻的 Sink
+        Map<String, String> assignment = new HashMap<>();
+        for (Map.Entry<String, Long> entry : sortedTopics) {
+            String topic = entry.getKey();
+            long bytes = entry.getValue();
+            
+            // 找到当前负载最轻的 Sink
+            String lightestSink = sinkLoad.entrySet().stream()
+                .min(Map.Entry.comparingByValue())
+                .get().getKey();
+            
+            assignment.put(topic, lightestSink);
+            sinkLoad.merge(lightestSink, bytes, Long::sum);
+        }
+        
+        // 4. 验证负载偏差
+        long maxLoad = Collections.max(sinkLoad.values());
+        long minLoad = Collections.min(sinkLoad.values());
+        long avgLoad = sinkLoad.values().stream()
+            .mapToLong(Long::longValue).sum() / sinkIds.size();
+        
+        double deviation = avgLoad > 0 
+            ? (double)(maxLoad - minLoad) / avgLoad * 100 : 0;
+        
+        if (deviation > 10.0) {
+            log.warn("负载均衡偏差 {:.1f}% 超过阈值 10%，尝试细粒度再均衡", 
+                deviation);
+            rebalanceFinegrained(assignment, sinkLoad, topicBytesStats);
+        }
+        
+        return assignment;
+    }
+    
+    /**
+     * 细粒度再均衡：将负载最重节点的最小 Topic 迁移到负载最轻节点
+     * 迭代直到偏差 ≤ 10% 或无法进一步优化
+     */
+    private void rebalanceFinegrained(Map<String, String> assignment,
+            Map<String, Long> sinkLoad, Map<String, Long> topicBytesStats) {
+        for (int i = 0; i < 100; i++) {  // 最多迭代 100 次
+            String heaviest = findHeaviestSink(sinkLoad);
+            String lightest = findLightestSink(sinkLoad);
+            
+            if (sinkLoad.get(heaviest) - sinkLoad.get(lightest) 
+                    <= sinkLoad.values().stream().mapToLong(Long::longValue).sum() 
+                       / sinkLoad.size() * 0.1) {
+                break;  // 偏差已 ≤ 10%
+            }
+            
+            // 从最重节点找到可迁移的最小 Topic
+            Optional<String> topicToMove = assignment.entrySet().stream()
+                .filter(e -> e.getValue().equals(heaviest))
+                .min(Comparator.comparingLong(e -> topicBytesStats.get(e.getKey())))
+                .map(Map.Entry::getKey);
+            
+            if (topicToMove.isPresent()) {
+                String topic = topicToMove.get();
+                long bytes = topicBytesStats.get(topic);
+                assignment.put(topic, lightest);
+                sinkLoad.merge(heaviest, -bytes, Long::sum);
+                sinkLoad.merge(lightest, bytes, Long::sum);
+            } else {
+                break;
+            }
+        }
+    }
+}
+```
+
+**负载均衡数据流**：
+
+```
+Source                              NameServer KV                     Sink-1 / Sink-2 / Sink-N
+  │                                      │                                   │
+  ├─► 统计 topicBytesStats ─────────────►│ PUT topicStats                    │
+  │   每 10s 更新                         │                                   │
+  │                                      │                                   │
+  │                                      │◄─── GET topicStats ──────────────┤
+  │                                      │     每 30s 读取                   │
+  │                                      │                                   │
+  │                                      │                                   ├─► DistributedLoadBalancer
+  │                                      │                                   │   .calculateAssignment()
+  │                                      │                                   │
+  │                                      │                                   ├─► 仅消费分配给自己的 Topic
+  │                                      │                                   │   → PullRequest.topicFilter
+  │◄──── PullRequest(topicFilter) ───────┼───────────────────────────────────┤
+  │                                      │                                   │
+  ├────► PullResponse ──────────────────►│                                   │
+  │                                      │                                   │
+```
+
+#### 11.3.4 Sink 节点发现与再均衡
+
+> **对应需求**：需求 18 §8
+
+**Sink 节点注册**：
+
+每个 Sink 启动后将自身注册到 NameServer KV：
+
+```
+Namespace: SYNC_SINK_REGISTRY
+Key: {brokerName}:sink:{sinkId}:heartbeat
+Value: {timestamp}
+```
+
+每 15 秒刷新一次心跳。心跳超过 60 秒未更新的 Sink 视为下线。
+
+**再均衡触发条件**：
+
+| 触发条件 | 检测方式 | 处理 |
+|---------|---------|------|
+| 新 Sink 节点加入 | 定期（30s）检查 SYNC_SINK_REGISTRY 节点数变化 | 触发 rebalance |
+| Sink 节点下线 | 心跳超时（60s 未更新） | 触发 rebalance |
+| Topic 流量分布剧烈变化 | 最大/最小 Sink 负载偏差 > 20% | 触发 rebalance |
+
+**再均衡流程**：
+
+```
+1. 任意 Sink 检测到节点数变化
+
+2. 所有 Sink 同时重新读取 topicBytesStats 和 activeSinkIds
+
+3. 各 Sink 使用相同的 DistributedLoadBalancer.calculateAssignment() 算法
+   → 输入相同（topicBytesStats + sinkIds 排序后列表）
+   → 输出确定性一致（无需协调即可达成一致分配结果）
+
+4. 各 Sink 更新自身的 topicFilter
+   → 仅消费分配给自己的 Topic
+
+5. 下一次 PullRequest 携带新的 topicFilter
+   → 平滑过渡，无需停机
+
+注意：再均衡期间可能存在短暂的消息重复处理（At-Least-Once）
+```
+
+#### 11.3.5 Source 启动日志
+
+> **对应需求**：需求 18 §3
+
+```
+INFO [main] HASource - =============================================
+INFO [main] HASource - Source 节点启动
+INFO [main] HASource -   nodeId: source-node-01
+INFO [main] HASource -   lockProvider: nameserver-kv
+INFO [main] HASource -   lockKey: broker-a:source:lock
+INFO [main] HASource -   lockTTL: 30000ms
+INFO [main] HASource -   pid: 12345
+INFO [main] HASource -   hostname: prod-server-01
+INFO [main] HASource - =============================================
 ```
 
 ---
@@ -2685,9 +3764,9 @@ CMD ["--configFile=/app/ha-sync-source.properties"]
 | 需求 15 | 网络抖动自动重试 | 第 7.6 章 |
 | 需求 16 | 目标不可写监控 | 第 7.7 章 |
 | 需求 17 | 优雅停机快照 | 第 5.7 章 |
-| 需求 18 | 分布式负载均衡 | 第 11.3 章 |
-| 需求 19 | 全链路 Trace 监控 | 第 8.6、9 章 |
-| 需求 20 | 监控指标采集 | 第 8 章 |
+| 需求 18 | 分布式负载均衡 | 第 11.3 章（含 11.3.1~11.3.5 详细设计） |
+| 需求 19 | 全链路 Trace 监控 | 第 8.6 章（含 8.6.1~8.6.5 TraceCollector 详细设计）、9 章 |
+| 需求 20 | 监控指标采集 | 第 8 章（含 8.8.3 滑动窗口指标计算实现） |
 
 ### B. 参考文档
 

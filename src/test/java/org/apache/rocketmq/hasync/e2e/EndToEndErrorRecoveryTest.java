@@ -1,7 +1,7 @@
 package org.apache.rocketmq.hasync.e2e;
 
 import org.apache.rocketmq.hasync.core.CheckpointCoordinator;
-import org.apache.rocketmq.hasync.core.SyncPipeline;
+import org.apache.rocketmq.hasync.core.TestSyncPipelineHelper;
 import org.apache.rocketmq.hasync.core.SyncSink;
 import org.apache.rocketmq.hasync.core.SyncSource;
 import org.apache.rocketmq.hasync.model.SyncRecord;
@@ -32,7 +32,7 @@ import static org.junit.Assert.*;
  */
 public class EndToEndErrorRecoveryTest {
 
-    private SyncPipeline pipeline;
+    private TestSyncPipelineHelper pipeline;
 
     @After
     public void tearDown() {
@@ -48,7 +48,7 @@ public class EndToEndErrorRecoveryTest {
         FailingSource failSource = new FailingSource(true, false);
         TrackingSink trackSink = new TrackingSink();
 
-        pipeline = new SyncPipeline(failSource, Collections.<SyncSink>singletonList(trackSink));
+        pipeline = new TestSyncPipelineHelper(failSource, Collections.<SyncSink>singletonList(trackSink));
         try {
             pipeline.start();
             fail("Source 启动失败应抛出异常");
@@ -68,7 +68,7 @@ public class EndToEndErrorRecoveryTest {
         TrackingSource trackSource = new TrackingSource();
         FailingSink failSink = new FailingSink(true, false, 0);
 
-        pipeline = new SyncPipeline(trackSource, Collections.<SyncSink>singletonList(failSink));
+        pipeline = new TestSyncPipelineHelper(trackSource, Collections.<SyncSink>singletonList(failSink));
         try {
             pipeline.start();
             fail("Sink 启动失败应抛出异常");
@@ -90,7 +90,7 @@ public class EndToEndErrorRecoveryTest {
         // 前 3 次写入抛异常，之后正常
         FailingSink sink = new FailingSink(false, true, 3);
 
-        pipeline = new SyncPipeline(source, Collections.<SyncSink>singletonList(sink), 50);
+        pipeline = new TestSyncPipelineHelper(source, Collections.<SyncSink>singletonList(sink), 50);
         pipeline.start();
 
         // 投递 10 条消息
@@ -119,7 +119,7 @@ public class EndToEndErrorRecoveryTest {
         InterruptibleSource source = new InterruptibleSource(initialFailCount);
         TrackingSink sink = new TrackingSink();
 
-        pipeline = new SyncPipeline(source, Collections.<SyncSink>singletonList(sink), 50);
+        pipeline = new TestSyncPipelineHelper(source, Collections.<SyncSink>singletonList(sink), 50);
         pipeline.start();
 
         // 给 Pipeline 一些时间运行（Source poll 异常后会休眠 1s 再重试）
@@ -140,7 +140,7 @@ public class EndToEndErrorRecoveryTest {
         // 所有写入都失败
         AlwaysFailingSink failSink = new AlwaysFailingSink();
 
-        pipeline = new SyncPipeline(source, Collections.<SyncSink>singletonList(failSink), 50);
+        pipeline = new TestSyncPipelineHelper(source, Collections.<SyncSink>singletonList(failSink), 50);
         pipeline.start();
 
         // 投递消息
@@ -164,7 +164,7 @@ public class EndToEndErrorRecoveryTest {
         TrackingSource source = new TrackingSource();
         TrackingSink sink = new TrackingSink();
 
-        pipeline = new SyncPipeline(source, Collections.<SyncSink>singletonList(sink));
+        pipeline = new TestSyncPipelineHelper(source, Collections.<SyncSink>singletonList(sink));
         pipeline.start();
         assertTrue(pipeline.isRunning());
 
@@ -183,7 +183,7 @@ public class EndToEndErrorRecoveryTest {
         TrackingSource source = new TrackingSource();
         TrackingSink sink = new TrackingSink();
 
-        pipeline = new SyncPipeline(source, Collections.<SyncSink>singletonList(sink));
+        pipeline = new TestSyncPipelineHelper(source, Collections.<SyncSink>singletonList(sink));
         pipeline.start();
         pipeline.stopAll();
         assertFalse(pipeline.isRunning());
@@ -201,7 +201,7 @@ public class EndToEndErrorRecoveryTest {
         // Sink 写入非常慢
         SlowSink slowSink = new SlowSink(500);
 
-        pipeline = new SyncPipeline(source, Collections.<SyncSink>singletonList(slowSink), 3);
+        pipeline = new TestSyncPipelineHelper(source, Collections.<SyncSink>singletonList(slowSink), 3);
         // 不启动 Pipeline，队列无消费者
         for (int i = 0; i < 3; i++) {
             SyncRecord r = new SyncRecord();
@@ -225,7 +225,7 @@ public class EndToEndErrorRecoveryTest {
         TrackingSource source = new TrackingSource();
         TrackingSink sink = new TrackingSink();
 
-        pipeline = new SyncPipeline(source, Collections.<SyncSink>singletonList(sink), 2);
+        pipeline = new TestSyncPipelineHelper(source, Collections.<SyncSink>singletonList(sink), 2);
         SyncRecord r1 = new SyncRecord();
         SyncRecord r2 = new SyncRecord();
         SyncRecord r3 = new SyncRecord();
@@ -248,7 +248,7 @@ public class EndToEndErrorRecoveryTest {
         ErrorOnStopSink errorSink = new ErrorOnStopSink();
         TrackingSink normalSink = new TrackingSink();
 
-        pipeline = new SyncPipeline(source,
+        pipeline = new TestSyncPipelineHelper(source,
                 java.util.Arrays.<SyncSink>asList(errorSink, normalSink));
         pipeline.start();
         assertTrue(pipeline.isRunning());

@@ -1,7 +1,7 @@
 package org.apache.rocketmq.hasync.e2e;
 
 import org.apache.rocketmq.hasync.core.CheckpointCoordinator;
-import org.apache.rocketmq.hasync.core.SyncPipeline;
+import org.apache.rocketmq.hasync.core.TestSyncPipelineHelper;
 import org.apache.rocketmq.hasync.core.SyncSink;
 import org.apache.rocketmq.hasync.core.SyncSource;
 import org.apache.rocketmq.hasync.metrics.MetricsCollector;
@@ -39,7 +39,7 @@ import static org.junit.Assert.*;
 public class EndToEndExceptionScenariosTest {
 
     private static TestReportGenerator report;
-    private SyncPipeline pipeline;
+    private TestSyncPipelineHelper pipeline;
 
     @BeforeClass
     public static void initReport() {
@@ -67,7 +67,7 @@ public class EndToEndExceptionScenariosTest {
             MasterDownSource source = new MasterDownSource();
             TrackingSink sink = new TrackingSink("sink-1");
 
-            pipeline = new SyncPipeline(source, Collections.<SyncSink>singletonList(sink), 50);
+            pipeline = new TestSyncPipelineHelper(source, Collections.<SyncSink>singletonList(sink), 50);
             pipeline.start();
             Thread.sleep(2000);
 
@@ -97,7 +97,7 @@ public class EndToEndExceptionScenariosTest {
             ExponentialBackoffSource source = new ExponentialBackoffSource(5);
             TrackingSink sink = new TrackingSink("sink-1");
 
-            pipeline = new SyncPipeline(source, Collections.<SyncSink>singletonList(sink), 50);
+            pipeline = new TestSyncPipelineHelper(source, Collections.<SyncSink>singletonList(sink), 50);
             pipeline.start();
             Thread.sleep(8000);
 
@@ -127,7 +127,7 @@ public class EndToEndExceptionScenariosTest {
             AlwaysFailPollSource source = new AlwaysFailPollSource();
             TrackingSink sink = new TrackingSink("sink-1");
 
-            pipeline = new SyncPipeline(source, Collections.<SyncSink>singletonList(sink), 50);
+            pipeline = new TestSyncPipelineHelper(source, Collections.<SyncSink>singletonList(sink), 50);
             pipeline.start();
             Thread.sleep(5000);
 
@@ -166,7 +166,7 @@ public class EndToEndExceptionScenariosTest {
             FlashCutSource source = new FlashCutSource(recovered);
             CheckpointAwareSink sink = new CheckpointAwareSink(checkpoint, "sink-1");
 
-            pipeline = new SyncPipeline(source, Collections.<SyncSink>singletonList(sink), 50);
+            pipeline = new TestSyncPipelineHelper(source, Collections.<SyncSink>singletonList(sink), 50);
             pipeline.start();
 
             // 投递从 recovered offset 开始的消息
@@ -225,7 +225,7 @@ public class EndToEndExceptionScenariosTest {
             ParseErrorSkipSink sink = new ParseErrorSkipSink(checkpoint, "sink-parse");
             SimpleSource source = new SimpleSource();
 
-            pipeline = new SyncPipeline(source, Collections.<SyncSink>singletonList(sink), 50);
+            pipeline = new TestSyncPipelineHelper(source, Collections.<SyncSink>singletonList(sink), 50);
             pipeline.start();
 
             // 投递混合消息：正常 + 解析失败标记
@@ -341,7 +341,7 @@ public class EndToEndExceptionScenariosTest {
             RecordingSink sink = new RecordingSink(checkpoint, "sink-suspend");
             SuspendableSource source = new SuspendableSource();
 
-            pipeline = new SyncPipeline(source, Collections.<SyncSink>singletonList(sink), 100);
+            pipeline = new TestSyncPipelineHelper(source, Collections.<SyncSink>singletonList(sink), 100);
             pipeline.start();
 
             // 先投递消息
@@ -380,7 +380,7 @@ public class EndToEndExceptionScenariosTest {
             RetryableSink sink = new RetryableSink(checkpoint, "sink-retry", 2);
             SimpleSource source = new SimpleSource();
 
-            pipeline = new SyncPipeline(source, Collections.<SyncSink>singletonList(sink), 50);
+            pipeline = new TestSyncPipelineHelper(source, Collections.<SyncSink>singletonList(sink), 50);
             pipeline.start();
 
             SyncRecord r = createRecord(1000, "retry-topic", 0, "retry-msg");
@@ -666,7 +666,7 @@ public class EndToEndExceptionScenariosTest {
             RecordingSink sink = new RecordingSink(checkpoint, "sink-shutdown");
             SimpleSource source = new SimpleSource();
 
-            pipeline = new SyncPipeline(source, Collections.<SyncSink>singletonList(sink), 100);
+            pipeline = new TestSyncPipelineHelper(source, Collections.<SyncSink>singletonList(sink), 100);
             pipeline.start();
 
             // 投递消息
@@ -700,7 +700,7 @@ public class EndToEndExceptionScenariosTest {
             RecordingSink sink = new RecordingSink(checkpoint, "sink-ckpt-flush");
             SimpleSource source = new SimpleSource();
 
-            pipeline = new SyncPipeline(source, Collections.<SyncSink>singletonList(sink), 50);
+            pipeline = new TestSyncPipelineHelper(source, Collections.<SyncSink>singletonList(sink), 50);
             pipeline.start();
 
             for (int i = 0; i < 5; i++) {

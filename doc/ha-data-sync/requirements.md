@@ -10,26 +10,29 @@
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│                         SyncPipeline（管道）                          │
+│                      Source Worker（单节点）                          │
 │                                                                      │
-│  ┌──────────────────┐   SyncRecord Queue   ┌──────────────────────┐  │
-│  │   HASource        │ ──────────────────► │  Sink（分布式多节点）  │  │
-│  │  (单节点，拉取)   │   含流量统计元信息   │  (写入目标 RocketMQ)  │  │
+│  ┌──────────────────┐   ZMQ REP Socket   ┌──────────────────────┐   │
+│  │   HASource        │ ◄─── REQ-REP ───► │  Sink（分布式多节点）  │  │
+│  │  (单节点，拉取)   │   PullReq/Resp    │  (写入目标 RocketMQ)  │  │
 │  └──────────────────┘                     └──────────────────────┘  │
 │           │                                          │               │
 │    CheckpointCoordinator（位点协调器）◄───────────────┘               │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-- **HASource（单节点）**：负责连接 Master、接收 CommitLog 数据、解析消息，统计每个 Topic 的消息字节数，将解析后的 `SyncRecord` 放入内部队列；Source 只在一个节点上运行，节点故障后在其他节点重启
-- **Sink（分布式）**：按 Source 统计的各 Topic 流量，将消息均匀写入目标 RocketMQ 集群；多个 Sink 节点并行工作
+- **HASource（单节点）**：负责连接 Master、接收 CommitLog 数据、解析消息，统计每个 Topic 的消息字节数，将解析后的 `SyncRecord` 暂存于本地内存缓冲区，通过 ZMQ REP Socket 向 Sink 提供数据；Source 只在一个节点上运行，节点故障后在其他节点重启
+- **Sink（分布式）**：通过 ZMQ REQ Socket 从 Source 拉取数据，按 Source 统计的各 Topic 流量，将消息均匀写入目标 RocketMQ 集群；多个 Sink 节点并行工作
 - **SyncRecord**：Source 与 Sink 之间传递的数据单元，包含消息内容、偏移量、Topic、字节数等元信息
 - **CheckpointCoordinator**：协调 Source 与 Sink 的位点，仅在 Sink 确认写入落盘后才推进 `confirmedOffset`
-- **SyncPipeline**：组装 Source 和 Sink，管理生命周期（启动、停止、重连）
+
+> **统一通信模型**：Source 与 Sink 之间**统一**通过 ZeroMQ REQ-REP 模式通信，无论是独立部署还是同进程启动，均使用相同的通信、发现逻辑，确保行为完全一致，减少维护差异。Source 启动时可通过 `--with-sink` 参数在同一进程内嵌启动 Sink 实例，此时 Sink 通过 `localhost` ZMQ 连接 Source，通信协议与独立部署完全相同。
 
 **核心特性：**
 - Source/Sink 解耦，Source 专注数据拉取与流量统计，Sink 专注数据写入，可独立扩展
-- **Source 与 Sink 独立部署**：Source 和 Sink 作为独立 Worker 进程运行，通过 ZeroMQ（REQ-REP 模式）进行通信；Source 启动后将自身地址注册到目标集群 NameServer 的 KV 存储中，Sink 通过目标集群 NameServer KV 自动发现 Source 地址
+- **统一 ZMQ 通信模型**：Source 和 Sink **始终**通过 ZeroMQ（REQ-REP 模式）通信，无论是独立部署还是同进程启动，通信协议和服务发现逻辑完全一致，减少维护差异
+- **灵活部署模式**：Source 和 Sink 可作为独立 Worker 进程运行（独立部署），也可通过 `--with-sink` 参数让 Source 在同一进程内嵌启动 Sink（同进程模式），两种模式下 Sink 均通过 ZMQ 从 Source 拉取数据
+- **Source 地址注册**：Source 启动后将自身 ZMQ 地址注册到目标集群 NameServer 的 KV 存储中，Sink 通过目标集群 NameServer KV 自动发现 Source 地址
 - **完全无状态设计**：Checkpoint 等状态信息存储在目标集群 NameServer KV 中，Source 和 Sink 均无本地状态，可随意迁移和替换
 - 通过 NameServer 动态发现 Master Broker 的 HA 地址，Master 切换后自动重连
 - 不参与主从切换选举，仅作为只读数据复制节点
@@ -93,6 +96,7 @@
    | `--rfqMaxRetry <n>` | `3` | RFQ 消息发送失败最大重试次数 |
    | `--parseErrorSuspendWindowMs <ms>` | `60000` | 解析失败暂停检测的滑动窗口时长 |
    | `--metaSyncInterval <ms>` | `60000` | 元数据同步间隔 |
+   | `--with-sink` | `false` | 是否在 Source 同进程内嵌启动 Sink 实例。指定后 Source 进程内自动创建 Sink，Sink 通过 `localhost:{zmqPort}` 连接 Source ZMQ REP Socket，通信和服务发现逻辑与独立部署完全一致 |
 
 **Sink 启动参数（ha-sync-sink 进程）：**
 
@@ -194,23 +198,22 @@
    - **`SyncRecord` 数据类**：Source 与 Sink 之间传递的数据单元，包含字段：`masterPhyOffset`（数据包起始偏移量）、`endOffset`（数据包结束偏移量）、`physicOffset`（消息物理偏移量，作为绝对顺序依据，**Sink 必须严格按此字段升序写入目标集群**）、`topic`（消息 Topic）、`queueId`（消息所属队列 ID）、`body`（消息体字节数组）、`msgSize`（消息大小字节数）、`storeTimestamp`（存储时间戳）、`receiveTimestamp`（接收时间戳）、`traceId`（全链路追踪 ID）
    - **`CheckpointCoordinator` 接口**：定义位点读取（`getConfirmedOffset()`）和推进（`commitOffset(long offset)`）方法，由 Sink 在写入落盘后调用 `commitOffset`
 
-2. WHEN 系统设计时 THEN 系统 SHALL 定义 **`SyncPipeline`** 类，负责：
-   - 持有一个 `SyncSource` 实例和一个或多个 `SyncSink` 实例
-   - 管理 Source 和 Sink 的启动、停止生命周期
-   - 通过内部有界阻塞队列（`BlockingQueue<SyncRecord>`，默认容量 1000）连接 Source 和 Sink
-   - Source 线程将 `SyncRecord` 放入队列（`offer`，满时阻塞），Sink 线程从队列取出并写入（`poll`，空时等待）
-   - 当 Source 或 Sink 任一发生不可恢复异常时，`SyncPipeline` SHALL 停止整个管道并记录 ERROR 日志
+2. WHEN 系统设计时 THEN Source 和 Sink 之间 SHALL **统一**通过 ZeroMQ REQ-REP 模式通信（Sink 主动拉取），Source 将解析后的 `SyncRecord` 暂存于本地内存缓冲区，Sink 通过 ZMQ 拉取。不存在 BlockingQueue 直连模式，所有部署形态下通信逻辑完全一致。
+   - Source 启动时可通过 `--with-sink` 参数指定是否在同一进程内嵌启动 Sink 实例
+   - 同进程内嵌的 Sink 通过 `localhost:{zmqPort}` 连接 Source 的 ZMQ REP Socket，通信协议和服务发现与独立部署完全相同
+   - 当 Source 或 Sink 任一发生不可恢复异常时，系统 SHALL 记录 ERROR 日志并停止相关组件
 
 3. WHEN 系统设计时 THEN 系统 SHALL 实现 **`HASource`**（`SyncSource` 的具体实现），职责为：
    - 通过 NameServer 发现 Master HA 地址
    - 使用 DefaultHAService Slave 协议与 Master 建立 TCP 连接
-   - 持续接收并解析 CommitLog 数据包，将每条消息封装为 `SyncRecord` 放入队列
+   - 持续接收并解析 CommitLog 数据包，将每条消息封装为 `SyncRecord` 暂存于本地内存缓冲区
+   - 通过 ZMQ REP Socket 响应 Sink 的 PullRequest，按需返回缓冲区中的 SyncRecord
    - 统计每个 Topic 的消息字节数（`topicBytesStats`），供 Sink 侧流量均衡使用
    - 处理 Master 宕机、网络闪断等异常，自动重连
    - **不执行 Topic 过滤和存储写入**，这些职责属于 Sink
 
 4. WHEN 系统设计时 THEN 系统 SHALL 实现 **`RocketMQSink`**（`SyncSink` 的默认实现），职责为：
-   - 从队列消费 `SyncRecord`
+   - 通过 ZMQ REQ Socket 从 Source 拉取 `SyncRecord`
    - 执行 Topic 过滤（白名单匹配）
    - **严格按照 `SyncRecord.physicOffset` 升序将消息写入目标 RocketMQ 集群**，保证 Source 获取到 Master 的消息顺序与 Sink 写入目标的顺序严格一致
    - 写入目标集群时，保留原始消息的 `queueId`，确保消息写入目标集群的同名 Topic 的**相同 Queue**，保证同一 Queue 内的消息顺序与源集群完全一致
@@ -219,7 +222,7 @@
 
 5. WHEN 系统设计时 THEN 系统 SHALL 确保 Source 和 Sink 的**监控指标相互独立**，并支持全链路 Trace 跟踪（详见需求 19）
 
-6. WHEN 系统设计时 THEN 系统 SHALL 支持通过工厂方法或构造器注入不同的 `SyncSink` 实现，以便未来扩展，而无需修改 `HASource` 或 `SyncPipeline` 的代码
+6. WHEN 系统设计时 THEN 系统 SHALL 支持通过工厂方法或构造器注入不同的 `SyncSink` 实现，以便未来扩展，而无需修改 `HASource` 或 `SourceBootstrap` 的代码
 
 **消息顺序严格一致性保证：**
 
@@ -513,7 +516,7 @@
 
 ### 需求 14：异常处理策略
 
-**用户故事：** 作为一名数据同步组件，我希望在各类异常场景下能自动恢复并继续同步，以便在生产环境中保持高可用性。异常处理主要由 HASource 负责连接层恢复，SyncPipeline 负责协调 Source/Sink 的重启，恢复后通过 Checkpoint 断点续传保证最终一致性（允许少量重复消息）。
+**用户故事：** 作为一名数据同步组件，我希望在各类异常场景下能自动恢复并继续同步，以便在生产环境中保持高可用性。异常处理主要由 HASource 负责连接层恢复，Source 和 Sink 各自负责自身组件的异常处理和重启，恢复后通过 Checkpoint 断点续传保证最终一致性（允许少量重复消息）。
 
 #### 验收标准
 
@@ -675,10 +678,10 @@
 
 7. WHEN 系统设计时 THEN 系统 SHALL 采用以下机制保证高同步 TPS：
    - HASource 使用 NIO 非阻塞 IO 接收数据，避免 IO 阻塞影响吞吐量
-   - Source 与 Sink 之间使用有界阻塞队列（`LinkedBlockingQueue`）解耦，队列容量可通过 `--queueCapacity` 配置（默认 1000）
+   - Source 将解析后的 SyncRecord 暂存于本地内存缓冲区，Sink 通过 ZMQ REQ-REP 模式主动拉取，批次大小可通过 `--sinkBatchSize` 配置（默认 100）
    - Sink 支持批量发送（`--sinkBatchSize`，默认 100 条/批），减少 RocketMQ Producer 的 RPC 调用次数
    - Sink 支持多线程并发写入（`--sinkThreads`，默认 4 个线程），充分利用多核 CPU
-8. WHEN `queueSize` 持续超过队列容量的 80% 时 THEN 系统 SHALL 打印 WARN 日志，提示 Sink 处理速度跟不上 Source 拉取速度，建议增加 Sink 线程数或 Sink 节点数
+8. WHEN Source 内存缓冲区中待拉取的 SyncRecord 数量持续超过 80% 上限时 THEN 系统 SHALL 打印 WARN 日志，提示 Sink 处理速度跟不上 Source 拉取速度，建议增加 Sink 线程数或 Sink 节点数
 
 ---
 
@@ -714,9 +717,8 @@
    - **startupCheckResult**：最近一次启动一致性校验结果，枚举值为 `PASSED` / `FAILED` / `SKIPPED`
    - **startupCheckMsgFound**：启动一致性校验中在目标集群找到的消息条数
 
-3. WHEN 组件运行时 THEN 系统 SHALL 统计并暴露以下 **Pipeline 侧指标**（由 `SyncPipeline` 聚合）：
+3. WHEN 组件运行时 THEN 系统 SHALL 统计并暴露以下 **Pipeline 侧指标**（由 Source/Sink 协调聚合）：
    - **syncBytesPerSecond**：每秒从 Master 接收并写入的字节数（滑动窗口，窗口大小 1 秒）
-   - **queueSize**：Source→Sink 内部队列当前积压的 `SyncRecord` 数量
    - **confirmedOffset**：当前已确认落盘的同步位点（来自 `CheckpointCoordinator`）
    - **masterOffset**：最近一次从 Master 收到的数据包的起始偏移量（来自 `HASource`）
    - **lagBytes**：`masterOffset - confirmedOffset`，表示当前同步滞后量（字节数）

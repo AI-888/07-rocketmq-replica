@@ -1,7 +1,7 @@
 package org.apache.rocketmq.hasync.e2e;
 
 import org.apache.rocketmq.hasync.core.CheckpointCoordinator;
-import org.apache.rocketmq.hasync.core.SyncPipeline;
+import org.apache.rocketmq.hasync.core.TestSyncPipelineHelper;
 import org.apache.rocketmq.hasync.core.SyncSink;
 import org.apache.rocketmq.hasync.core.SyncSource;
 import org.apache.rocketmq.hasync.model.SyncRecord;
@@ -34,7 +34,7 @@ import static org.junit.Assert.*;
  */
 public class EndToEndGracefulShutdownTest {
 
-    private SyncPipeline pipeline;
+    private TestSyncPipelineHelper pipeline;
 
     @After
     public void tearDown() {
@@ -50,7 +50,7 @@ public class EndToEndGracefulShutdownTest {
         OrderedShutdownSource source = new OrderedShutdownSource();
         OrderedShutdownSink sink = new OrderedShutdownSink("sink-1");
 
-        pipeline = new SyncPipeline(source, Collections.<SyncSink>singletonList(sink));
+        pipeline = new TestSyncPipelineHelper(source, Collections.<SyncSink>singletonList(sink));
         pipeline.start();
         assertTrue(pipeline.isRunning());
 
@@ -68,7 +68,7 @@ public class EndToEndGracefulShutdownTest {
         OrderedShutdownSource source = new OrderedShutdownSource();
         DrainingSink sink = new DrainingSink();
 
-        pipeline = new SyncPipeline(source, Collections.<SyncSink>singletonList(sink), 100);
+        pipeline = new TestSyncPipelineHelper(source, Collections.<SyncSink>singletonList(sink), 100);
         pipeline.start();
 
         // 投递一些数据
@@ -98,7 +98,7 @@ public class EndToEndGracefulShutdownTest {
         OrderedShutdownSource source = new OrderedShutdownSource(tracker, "source");
         OrderedShutdownSink sink = new OrderedShutdownSink("sink-1", tracker);
 
-        pipeline = new SyncPipeline(source, Collections.<SyncSink>singletonList(sink));
+        pipeline = new TestSyncPipelineHelper(source, Collections.<SyncSink>singletonList(sink));
         pipeline.start();
 
         pipeline.stopAll();
@@ -117,7 +117,7 @@ public class EndToEndGracefulShutdownTest {
         SimpleSource source = new SimpleSource();
         SimpleSink sink = new SimpleSink();
 
-        pipeline = new SyncPipeline(source, Collections.<SyncSink>singletonList(sink), 10);
+        pipeline = new TestSyncPipelineHelper(source, Collections.<SyncSink>singletonList(sink), 10);
         pipeline.start();
         pipeline.stopAll();
 
@@ -139,7 +139,7 @@ public class EndToEndGracefulShutdownTest {
         DrainingSink sink2 = new DrainingSink();
         DrainingSink sink3 = new DrainingSink();
 
-        pipeline = new SyncPipeline(source,
+        pipeline = new TestSyncPipelineHelper(source,
                 Arrays.<SyncSink>asList(sink1, sink2, sink3), 100);
         pipeline.start();
 
@@ -173,7 +173,7 @@ public class EndToEndGracefulShutdownTest {
         SimpleSource source = new SimpleSource();
         CheckpointAwareSink sink = new CheckpointAwareSink(checkpoint, "sink-ckpt");
 
-        pipeline = new SyncPipeline(source, Collections.<SyncSink>singletonList(sink), 50);
+        pipeline = new TestSyncPipelineHelper(source, Collections.<SyncSink>singletonList(sink), 50);
         pipeline.start();
 
         // 投递并等待处理
@@ -202,7 +202,7 @@ public class EndToEndGracefulShutdownTest {
         SimpleSource source = new SimpleSource();
         SimpleSink sink = new SimpleSink();
 
-        pipeline = new SyncPipeline(source, Collections.<SyncSink>singletonList(sink));
+        pipeline = new TestSyncPipelineHelper(source, Collections.<SyncSink>singletonList(sink));
         pipeline.start();
 
         // 多次调用 stopAll
@@ -220,7 +220,7 @@ public class EndToEndGracefulShutdownTest {
         SimpleSource source = new SimpleSource();
         SimpleSink sink = new SimpleSink();
 
-        pipeline = new SyncPipeline(source, Collections.<SyncSink>singletonList(sink));
+        pipeline = new TestSyncPipelineHelper(source, Collections.<SyncSink>singletonList(sink));
         pipeline.start();
 
         // 投递一些数据
@@ -244,12 +244,12 @@ public class EndToEndGracefulShutdownTest {
         SimpleSource source = new SimpleSource();
         SimpleSink sink = new SimpleSink();
 
-        pipeline = new SyncPipeline(source, Collections.<SyncSink>singletonList(sink));
+        pipeline = new TestSyncPipelineHelper(source, Collections.<SyncSink>singletonList(sink));
         pipeline.start();
 
         // 模拟 ShutdownHook 的行为
         final AtomicBoolean hookExecuted = new AtomicBoolean(false);
-        final SyncPipeline pipelineRef = pipeline;
+        final TestSyncPipelineHelper pipelineRef = pipeline;
 
         Thread shutdownHook = new Thread(() -> {
             if (pipelineRef.isRunning()) {
@@ -273,7 +273,7 @@ public class EndToEndGracefulShutdownTest {
         SimpleSource source = new SimpleSource();
         SimpleSink sink = new SimpleSink();
 
-        pipeline = new SyncPipeline(source, Collections.<SyncSink>singletonList(sink));
+        pipeline = new TestSyncPipelineHelper(source, Collections.<SyncSink>singletonList(sink));
         pipeline.start();
         // 不投递任何数据，立即停机
         pipeline.stopAll();
@@ -288,7 +288,7 @@ public class EndToEndGracefulShutdownTest {
         SimpleSource source = new SimpleSource();
         SimpleSink sink = new SimpleSink();
 
-        pipeline = new SyncPipeline(source, Collections.<SyncSink>singletonList(sink));
+        pipeline = new TestSyncPipelineHelper(source, Collections.<SyncSink>singletonList(sink));
         pipeline.start();
 
         // 多线程同时调用 stopAll

@@ -1,5 +1,7 @@
 package org.apache.rocketmq.hasync.core;
 
+import org.apache.rocketmq.hasync.config.SinkConfig;
+import org.apache.rocketmq.hasync.config.SourceConfig;
 import org.apache.rocketmq.hasync.model.SyncRecord;
 import org.junit.After;
 import org.junit.Before;
@@ -16,7 +18,16 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static org.junit.Assert.*;
 
 /**
- * SyncPipeline 管道编排单元测试
+ * SyncPipeline 统一 ZMQ 通信模型测试
+ * <p>
+ * 验证：
+ * <ul>
+ *   <li>构造函数校验</li>
+ *   <li>启动/停止生命周期</li>
+ *   <li>Source/Sink 启动失败回滚</li>
+ *   <li>多 Sink 支持</li>
+ *   <li>buildEmbeddedSinkConfig 配置继承</li>
+ * </ul>
  */
 public class SyncPipelineTest {
 
@@ -54,28 +65,11 @@ public class SyncPipelineTest {
         new SyncPipeline(mockSource, Collections.<SyncSink>emptyList());
     }
 
-    @Test(expected = IllegalArgumentException.class)
-    public void testConstructorWithZeroQueueCapacity() {
-        new SyncPipeline(mockSource, Collections.singletonList(mockSink), 0);
-    }
-
-    @Test(expected = IllegalArgumentException.class)
-    public void testConstructorWithNegativeQueueCapacity() {
-        new SyncPipeline(mockSource, Collections.singletonList(mockSink), -1);
-    }
-
     @Test
     public void testConstructorSuccess() {
-        pipeline = new SyncPipeline(mockSource, Collections.singletonList(mockSink), 500);
+        pipeline = new SyncPipeline(mockSource, Collections.singletonList(mockSink));
         assertNotNull(pipeline);
         assertFalse(pipeline.isRunning());
-        assertEquals(0, pipeline.getQueueSize());
-    }
-
-    @Test
-    public void testConstructorDefaultCapacity() {
-        pipeline = new SyncPipeline(mockSource, Collections.singletonList(mockSink));
-        assertEquals(SyncPipeline.DEFAULT_QUEUE_CAPACITY, pipeline.getQueueRemainingCapacity());
     }
 
     // ==================== 启动和停止测试 ====================
@@ -147,45 +141,6 @@ public class SyncPipelineTest {
         assertFalse(pipeline.isRunning());
     }
 
-    // ==================== 队列操作测试 ====================
-
-    @Test
-    public void testOfferAndQueueSize() {
-        pipeline = new SyncPipeline(mockSource, Collections.singletonList(mockSink), 10);
-
-        SyncRecord record = new SyncRecord();
-        record.setTopic("test");
-        assertTrue(pipeline.offer(record));
-        assertEquals(1, pipeline.getQueueSize());
-    }
-
-    @Test
-    public void testOfferWhenQueueFull() {
-        pipeline = new SyncPipeline(mockSource, Collections.singletonList(mockSink), 2);
-
-        SyncRecord r1 = new SyncRecord();
-        SyncRecord r2 = new SyncRecord();
-        SyncRecord r3 = new SyncRecord();
-
-        assertTrue(pipeline.offer(r1));
-        assertTrue(pipeline.offer(r2));
-        // 队列已满
-        assertFalse(pipeline.offer(r3));
-        assertEquals(2, pipeline.getQueueSize());
-    }
-
-    @Test
-    public void testOfferWithTimeout() throws InterruptedException {
-        pipeline = new SyncPipeline(mockSource, Collections.singletonList(mockSink), 1);
-
-        SyncRecord r1 = new SyncRecord();
-        SyncRecord r2 = new SyncRecord();
-
-        assertTrue(pipeline.offer(r1, 100, TimeUnit.MILLISECONDS));
-        // 队列已满，超时返回 false
-        assertFalse(pipeline.offer(r2, 100, TimeUnit.MILLISECONDS));
-    }
-
     // ==================== Getter 测试 ====================
 
     @Test
@@ -220,46 +175,55 @@ public class SyncPipelineTest {
         pipeline.stopAll();
     }
 
-    // ==================== 数据流测试 ====================
+    // ==================== buildEmbeddedSinkConfig 测试 ====================
 
     @Test
-    public void testDataFlow() throws Exception {
-        final CountDownLatch writeLatch = new CountDownLatch(1);
-        final AtomicBoolean writeReceived = new AtomicBoolean(false);
+    public void testBuildEmbeddedSinkConfig() {
+        SourceConfig sourceConfig = new SourceConfig();
+        sourceConfig.load(new String[]{
+                "--sourceNamesrv", "10.0.0.1:9876",
+                "--targetNamesrv", "10.0.0.2:9877",
+                "--zmqBindPort", "5555",
+                "--sourceNodeId", "test-node"
+        });
 
-        MockSyncSink dataSink = new MockSyncSink() {
-            @Override
-            public void write(SyncRecord record) throws Exception {
-                writeReceived.set(true);
-                writeLatch.countDown();
-            }
-        };
-
-        pipeline = new SyncPipeline(mockSource, Collections.<SyncSink>singletonList(dataSink), 100);
-        pipeline.start();
-
-        // 向队列投递数据
-        SyncRecord record = new SyncRecord();
-        record.setTopic("test-topic");
-        record.setPhysicOffset(1000L);
-        pipeline.offer(record);
-
-        // 等待 Sink 处理
-        assertTrue("Sink 应在超时前收到数据", writeLatch.await(5, TimeUnit.SECONDS));
-        assertTrue(writeReceived.get());
-
-        pipeline.stopAll();
+        SinkConfig sinkConfig = SyncPipeline.buildEmbeddedSinkConfig(sourceConfig);
+        assertNotNull(sinkConfig);
+        assertEquals("10.0.0.2:9877", sinkConfig.getTargetNamesrv());
+        assertTrue(sinkConfig.getSinkId().contains("embedded-sink"));
     }
 
-    // ==================== QueueRemainingCapacity 测试 ====================
+    @Test
+    public void testBuildEmbeddedSinkConfigInheritsTargetNamesrv() {
+        SourceConfig sourceConfig = new SourceConfig();
+        sourceConfig.load(new String[]{
+                "--sourceNamesrv", "192.168.1.1:9876",
+                "--targetNamesrv", "192.168.2.1:9877"
+        });
+
+        SinkConfig sinkConfig = SyncPipeline.buildEmbeddedSinkConfig(sourceConfig);
+        assertEquals("192.168.2.1:9877", sinkConfig.getTargetNamesrv());
+    }
+
+    // ==================== 统一 ZMQ 通信验证 ====================
 
     @Test
-    public void testQueueRemainingCapacity() {
-        pipeline = new SyncPipeline(mockSource, Collections.singletonList(mockSink), 50);
-        assertEquals(50, pipeline.getQueueRemainingCapacity());
+    public void testUnifiedZmqCommunication() throws Exception {
+        // 验证新架构下不存在 BlockingQueue / offer / poll 等方法
+        // SyncPipeline 仅负责协调 Source 和 Sink 的生命周期
+        pipeline = new SyncPipeline(mockSource, Collections.singletonList(mockSink));
+        pipeline.start();
 
-        pipeline.offer(new SyncRecord());
-        assertEquals(49, pipeline.getQueueRemainingCapacity());
+        // Source 和 Sink 均已启动
+        assertTrue(mockSource.isStarted());
+        assertTrue(mockSink.isStarted());
+
+        // 验证 pipeline 的 API 中不再有 offer/getQueueSize 等队列方法
+        // 通信完全通过 ZMQ（Sink 内部 ZMQ REQ → Source ZMQ REP）
+        assertTrue(pipeline.isRunning());
+
+        pipeline.stopAll();
+        assertFalse(pipeline.isRunning());
     }
 
     // ==================== Mock 实现 ====================

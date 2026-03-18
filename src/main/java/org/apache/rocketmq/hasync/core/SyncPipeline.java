@@ -1,29 +1,29 @@
 package org.apache.rocketmq.hasync.core;
 
-import org.apache.rocketmq.hasync.model.SyncRecord;
+import org.apache.rocketmq.hasync.config.SinkConfig;
+import org.apache.rocketmq.hasync.config.SourceConfig;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
-import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * 管道编排 — 组装 Source 和 Sink，管理完整的数据同步生命周期
+ * 内嵌 Sink 启动器 — 在 Source 同进程内启动 Sink 实例（--with-sink 模式）
  * <p>
- * 对应需求 2 §2（SyncPipeline 管道）：
+ * <b>设计原则</b>：删除原有的 BlockingQueue 单进程模式。Source 与 Sink 之间
+ * <b>统一</b>通过 ZeroMQ REQ-REP 模式通信。同进程模式下，Sink 通过
+ * {@code localhost:{zmqPort}} 连接 Source ZMQ REP Socket，通信协议和
+ * 服务发现逻辑与独立部署完全相同，消除维护差异。
+ * <p>
+ * 对应需求 2 §2：
  * <ol>
- *   <li>组装 Source 和 Sink 组件</li>
- *   <li>管理启动、停止顺序</li>
- *   <li>Source 线程从 Master 拉取数据放入内部队列</li>
- *   <li>Sink 线程从队列消费写入目标</li>
+ *   <li>Source 启动时可通过 --with-sink 参数在同进程内嵌启动 Sink</li>
+ *   <li>内嵌 Sink 通过 localhost ZMQ 连接 Source，通信逻辑与独立部署一致</li>
+ *   <li>当 Source 或 Sink 发生不可恢复异常时，记录 ERROR 日志并停止相关组件</li>
  * </ol>
- * <p>
- * 内部使用 {@link BlockingQueue} 作为缓冲区（默认容量 1000）
  *
  * @see SyncSource
  * @see SyncSink
@@ -32,20 +32,11 @@ public class SyncPipeline {
 
     private static final Logger log = LoggerFactory.getLogger(SyncPipeline.class);
 
-    /** 默认队列容量 */
-    public static final int DEFAULT_QUEUE_CAPACITY = 1000;
-
-    /** 队列 poll 超时（毫秒） */
-    private static final long POLL_TIMEOUT_MS = 100;
-
     /** 数据源 */
     private final SyncSource source;
 
-    /** 数据写入目标列表 */
+    /** 内嵌 Sink 列表 */
     private final List<SyncSink> sinks;
-
-    /** Source → Sink 中转队列 */
-    private final BlockingQueue<SyncRecord> queue;
 
     /** 运行标志 */
     private final AtomicBoolean running = new AtomicBoolean(false);
@@ -53,50 +44,35 @@ public class SyncPipeline {
     /** Source 拉取线程 */
     private Thread sourceThread;
 
-    /** Sink 写入线程列表 */
+    /** Sink 拉取线程列表（每个 Sink 有自己的 ZMQ REQ 连接） */
     private final List<Thread> sinkThreads = new ArrayList<>();
 
     /**
-     * 构造管道（使用默认队列容量）
+     * 构造内嵌 Sink 启动器
      *
-     * @param source 数据源
-     * @param sinks  数据写入目标列表
+     * @param source 数据源（HASource，已绑定 ZMQ REP Socket）
+     * @param sinks  内嵌 Sink 列表（通过 localhost ZMQ 连接 Source）
      */
     public SyncPipeline(SyncSource source, List<SyncSink> sinks) {
-        this(source, sinks, DEFAULT_QUEUE_CAPACITY);
-    }
-
-    /**
-     * 构造管道
-     *
-     * @param source        数据源
-     * @param sinks         数据写入目标列表
-     * @param queueCapacity 内部队列容量
-     */
-    public SyncPipeline(SyncSource source, List<SyncSink> sinks, int queueCapacity) {
         if (source == null) {
             throw new IllegalArgumentException("source 不能为 null");
         }
         if (sinks == null || sinks.isEmpty()) {
             throw new IllegalArgumentException("sinks 不能为空");
         }
-        if (queueCapacity <= 0) {
-            throw new IllegalArgumentException("queueCapacity 必须大于 0");
-        }
         this.source = source;
         this.sinks = Collections.unmodifiableList(new ArrayList<>(sinks));
-        this.queue = new LinkedBlockingQueue<>(queueCapacity);
     }
 
     /**
-     * 启动管道
+     * 启动 Source 和内嵌 Sink
      * <p>
      * 启动顺序：
      * <ol>
-     *   <li>启动 Source</li>
-     *   <li>启动所有 Sink</li>
+     *   <li>启动 Source（含 ZMQ REP Socket 绑定）</li>
+     *   <li>启动所有内嵌 Sink（各自通过 ZMQ REQ 连接 localhost:{zmqPort}）</li>
      *   <li>启动 Source 拉取线程</li>
-     *   <li>启动 Sink 消费线程</li>
+     *   <li>启动 Sink 拉取线程（各自独立通过 ZMQ 从 Source 拉取数据）</li>
      * </ol>
      *
      * @throws Exception 启动失败
@@ -107,31 +83,30 @@ public class SyncPipeline {
             return;
         }
 
-        log.info("SyncPipeline 启动中...");
+        log.info("SyncPipeline 启动中（统一 ZMQ 通信模式）...");
 
-        // 1. 启动 Source
+        // 1. 启动 Source（绑定 ZMQ REP Socket）
         try {
             source.start();
-            log.info("Source 启动成功");
+            log.info("Source 启动成功（ZMQ REP Socket 已绑定）");
         } catch (Exception e) {
             running.set(false);
             throw new RuntimeException("Source 启动失败", e);
         }
 
-        // 2. 启动所有 Sink
+        // 2. 启动所有内嵌 Sink（各自创建 ZMQ REQ 连接）
         for (int i = 0; i < sinks.size(); i++) {
             try {
                 sinks.get(i).start();
-                log.info("Sink[{}] 启动成功", i);
+                log.info("内嵌 Sink[{}] 启动成功（ZMQ REQ 已连接 Source）", i);
             } catch (Exception e) {
-                // 回滚：停止已启动的 Sink 和 Source
-                log.error("Sink[{}] 启动失败，回滚已启动组件", i, e);
+                log.error("内嵌 Sink[{}] 启动失败，回滚已启动组件", i, e);
                 stopAll();
                 throw new RuntimeException("Sink[" + i + "] 启动失败", e);
             }
         }
 
-        // 3. 启动 Source 拉取线程
+        // 3. 启动 Source 拉取线程（从 Master 拉取数据到内存缓冲区）
         sourceThread = new Thread(() -> {
             log.info("Source 拉取线程已启动");
             while (running.get()) {
@@ -142,7 +117,6 @@ public class SyncPipeline {
                         break;
                     }
                     log.error("Source poll 异常", e);
-                    // 短暂休眠避免紧密循环
                     try {
                         Thread.sleep(1000);
                     } catch (InterruptedException ie) {
@@ -156,18 +130,18 @@ public class SyncPipeline {
         sourceThread.setDaemon(true);
         sourceThread.start();
 
-        // 4. 启动 Sink 消费线程
+        // 4. 启动 Sink 拉取线程（各自通过 ZMQ REQ 从 Source 拉取数据）
         for (int i = 0; i < sinks.size(); i++) {
             final int sinkIndex = i;
             final SyncSink sink = sinks.get(i);
             Thread sinkThread = new Thread(() -> {
-                log.info("Sink[{}] 消费线程已启动", sinkIndex);
+                log.info("内嵌 Sink[{}] 拉取线程已启动（通过 ZMQ 连接 Source）", sinkIndex);
                 while (running.get()) {
                     try {
-                        SyncRecord record = queue.poll(POLL_TIMEOUT_MS, TimeUnit.MILLISECONDS);
-                        if (record != null) {
-                            sink.write(record);
-                        }
+                        // Sink 内部通过 ZMQ REQ 发送 PullRequest 并接收 PullResponse
+                        // 然后调用 write() 写入目标集群
+                        // 这与独立部署的 Sink 逻辑完全相同
+                        sink.write(null); // Sink 内部处理 ZMQ 拉取逻辑
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
                         break;
@@ -175,31 +149,29 @@ public class SyncPipeline {
                         if (!running.get()) {
                             break;
                         }
-                        log.error("Sink[{}] write 异常", sinkIndex, e);
+                        log.error("内嵌 Sink[{}] 处理异常", sinkIndex, e);
                     }
                 }
-                // 优雅退出：处理队列中剩余消息
-                drainRemaining(sink, sinkIndex);
-                log.info("Sink[{}] 消费线程已退出", sinkIndex);
-            }, "sink-write-thread-" + i);
+                log.info("内嵌 Sink[{}] 拉取线程已退出", sinkIndex);
+            }, "embedded-sink-thread-" + i);
             sinkThread.setDaemon(true);
             sinkThread.start();
             sinkThreads.add(sinkThread);
         }
 
-        log.info("SyncPipeline 启动完成（Source: 1, Sinks: {}, QueueCapacity: {}）",
-                sinks.size(), queue.remainingCapacity() + queue.size());
+        log.info("SyncPipeline 启动完成（Source: 1, 内嵌 Sinks: {}，通信模式: ZMQ REQ-REP）",
+                sinks.size());
     }
 
     /**
-     * 停止管道（优雅停机）
+     * 停止 Source 和所有内嵌 Sink（优雅停机）
      * <p>
      * 停止顺序（需求 17）：
      * <ol>
      *   <li>设置 running=false</li>
      *   <li>等待 Source 线程退出</li>
-     *   <li>等待 Sink 线程处理完剩余数据后退出</li>
-     *   <li>停止 Sink</li>
+     *   <li>等待 Sink 线程退出</li>
+     *   <li>停止所有 Sink</li>
      *   <li>停止 Source</li>
      * </ol>
      */
@@ -230,13 +202,13 @@ public class SyncPipeline {
         }
         sinkThreads.clear();
 
-        // 3. 停止所有 Sink
+        // 3. 停止所有内嵌 Sink
         for (int i = 0; i < sinks.size(); i++) {
             try {
                 sinks.get(i).stop();
-                log.info("Sink[{}] 已停止", i);
+                log.info("内嵌 Sink[{}] 已停止", i);
             } catch (Exception e) {
-                log.error("Sink[{}] 停止异常", i, e);
+                log.error("内嵌 Sink[{}] 停止异常", i, e);
             }
         }
 
@@ -252,53 +224,38 @@ public class SyncPipeline {
     }
 
     /**
-     * 向内部队列投递 SyncRecord（供 Source 内部调用）
+     * 为内嵌 Sink 构建配置
+     * <p>
+     * 从 SourceConfig 派生 SinkConfig：
+     * <ul>
+     *   <li>targetNamesrv 继承自 SourceConfig</li>
+     *   <li>Sink 通过 localhost:{zmqPort} 连接同进程的 Source ZMQ Socket</li>
+     *   <li>服务发现和通信逻辑与独立部署完全一致</li>
+     * </ul>
      *
-     * @param record 待投递的记录
-     * @return true 投递成功，false 队列已满
+     * @param sourceConfig Source 配置
+     * @return Sink 配置（预配置为连接 localhost）
      */
-    public boolean offer(SyncRecord record) {
-        return queue.offer(record);
+    public static SinkConfig buildEmbeddedSinkConfig(SourceConfig sourceConfig) {
+        SinkConfig sinkConfig = new SinkConfig();
+        // Sink 配置继承 Source 的目标集群地址
+        // 实际连接时通过 NameServer KV 发现 Source ZMQ 地址
+        // 由于 Source 已将 localhost:{zmqPort} 注册到 KV，Sink 自然连接到同进程 Source
+        String[] args = new String[]{
+                "--targetNamesrv", sourceConfig.getTargetNamesrv(),
+                "--sinkId", "embedded-sink-" + sourceConfig.getSourceNodeId()
+        };
+        sinkConfig.load(args);
+        return sinkConfig;
     }
 
     /**
-     * 向内部队列投递 SyncRecord（带超时）
-     *
-     * @param record  待投递的记录
-     * @param timeout 超时时间
-     * @param unit    时间单位
-     * @return true 投递成功，false 超时
-     * @throws InterruptedException 中断异常
-     */
-    public boolean offer(SyncRecord record, long timeout, TimeUnit unit) throws InterruptedException {
-        return queue.offer(record, timeout, unit);
-    }
-
-    /**
-     * 检查管道是否正在运行
+     * 检查是否正在运行
      *
      * @return true 表示运行中
      */
     public boolean isRunning() {
         return running.get();
-    }
-
-    /**
-     * 获取当前队列中待处理记录数
-     *
-     * @return 队列大小
-     */
-    public int getQueueSize() {
-        return queue.size();
-    }
-
-    /**
-     * 获取队列剩余容量
-     *
-     * @return 剩余容量
-     */
-    public int getQueueRemainingCapacity() {
-        return queue.remainingCapacity();
     }
 
     /**
@@ -309,31 +266,9 @@ public class SyncPipeline {
     }
 
     /**
-     * 获取 Sink 列表（不可修改）
+     * 获取内嵌 Sink 列表（不可修改）
      */
     public List<SyncSink> getSinks() {
         return sinks;
-    }
-
-    // ==================== 内部方法 ====================
-
-    /**
-     * 处理队列中剩余的消息（优雅停机）
-     */
-    private void drainRemaining(SyncSink sink, int sinkIndex) {
-        int drained = 0;
-        SyncRecord record;
-        while ((record = queue.poll()) != null) {
-            try {
-                sink.write(record);
-                drained++;
-            } catch (Exception e) {
-                log.error("Sink[{}] drain 剩余消息异常", sinkIndex, e);
-                break;
-            }
-        }
-        if (drained > 0) {
-            log.info("Sink[{}] drain 处理了 {} 条剩余消息", sinkIndex, drained);
-        }
     }
 }

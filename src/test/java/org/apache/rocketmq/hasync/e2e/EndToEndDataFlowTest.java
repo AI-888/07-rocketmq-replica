@@ -1,7 +1,7 @@
 package org.apache.rocketmq.hasync.e2e;
 
 import org.apache.rocketmq.hasync.core.CheckpointCoordinator;
-import org.apache.rocketmq.hasync.core.SyncPipeline;
+import org.apache.rocketmq.hasync.core.TestSyncPipelineHelper;
 import org.apache.rocketmq.hasync.core.SyncSink;
 import org.apache.rocketmq.hasync.core.SyncSource;
 import org.apache.rocketmq.hasync.model.PullRequest;
@@ -42,7 +42,7 @@ import static org.junit.Assert.*;
  */
 public class EndToEndDataFlowTest {
 
-    private SyncPipeline pipeline;
+    private TestSyncPipelineHelper pipeline;
 
     @After
     public void tearDown() {
@@ -64,7 +64,7 @@ public class EndToEndDataFlowTest {
         SimulatedSource source = new SimulatedSource(Collections.singletonList(record));
 
         // 组装并启动 Pipeline
-        pipeline = new SyncPipeline(source, Collections.<SyncSink>singletonList(sink), 100);
+        pipeline = new TestSyncPipelineHelper(source, Collections.<SyncSink>singletonList(sink), 100);
         pipeline.start();
 
         // Source 投递数据到 Pipeline
@@ -99,7 +99,7 @@ public class EndToEndDataFlowTest {
         OrderVerifyingSink sink = new OrderVerifyingSink(checkpoint, "sink-order");
         SimulatedSource source = new SimulatedSource(records);
 
-        pipeline = new SyncPipeline(source, Collections.<SyncSink>singletonList(sink), 200);
+        pipeline = new TestSyncPipelineHelper(source, Collections.<SyncSink>singletonList(sink), 200);
         pipeline.start();
 
         // 按顺序投递所有消息
@@ -137,7 +137,7 @@ public class EndToEndDataFlowTest {
         TopicGroupingSink sink = new TopicGroupingSink(checkpoint, "sink-multi");
         SimulatedSource source = new SimulatedSource(records);
 
-        pipeline = new SyncPipeline(source, Collections.<SyncSink>singletonList(sink), 100);
+        pipeline = new TestSyncPipelineHelper(source, Collections.<SyncSink>singletonList(sink), 100);
         pipeline.start();
 
         for (SyncRecord record : records) {
@@ -179,7 +179,7 @@ public class EndToEndDataFlowTest {
         RecordingSink sink2 = new RecordingSink(checkpoint, "sink-2");
         SimulatedSource source = new SimulatedSource(records);
 
-        pipeline = new SyncPipeline(source, Arrays.<SyncSink>asList(sink1, sink2), 100);
+        pipeline = new TestSyncPipelineHelper(source, Arrays.<SyncSink>asList(sink1, sink2), 100);
         pipeline.start();
 
         for (SyncRecord record : records) {
@@ -344,7 +344,7 @@ public class EndToEndDataFlowTest {
         RecordingSink sink = new RecordingSink(checkpoint, "sink-prop");
         SimulatedSource source = new SimulatedSource(Collections.singletonList(record));
 
-        pipeline = new SyncPipeline(source, Collections.<SyncSink>singletonList(sink), 10);
+        pipeline = new TestSyncPipelineHelper(source, Collections.<SyncSink>singletonList(sink), 10);
         pipeline.start();
         pipeline.offer(record);
 
@@ -378,7 +378,7 @@ public class EndToEndDataFlowTest {
         RecordingSink sink = new RecordingSink(checkpoint, "sink-large");
         SimulatedSource source = new SimulatedSource(records);
 
-        pipeline = new SyncPipeline(source, Collections.<SyncSink>singletonList(sink), 500);
+        pipeline = new TestSyncPipelineHelper(source, Collections.<SyncSink>singletonList(sink), 500);
         pipeline.start();
 
         // 使用独立线程投递，模拟 Source 持续产出
@@ -445,7 +445,7 @@ public class EndToEndDataFlowTest {
         RecordingSink sink = new RecordingSink(new InMemoryCheckpoint(), "sink-boundary");
         SimulatedSource source = new SimulatedSource(Collections.<SyncRecord>emptyList());
 
-        pipeline = new SyncPipeline(source, Collections.<SyncSink>singletonList(sink), capacity);
+        pipeline = new TestSyncPipelineHelper(source, Collections.<SyncSink>singletonList(sink), capacity);
         // 未启动时投递（只放入队列，无消费者）
         for (int i = 0; i < capacity; i++) {
             assertTrue("第 " + (i + 1) + " 条应成功投递",

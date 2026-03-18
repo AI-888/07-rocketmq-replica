@@ -43,6 +43,7 @@ public class SourceConfig extends AbstractConfig {
     public static final String META_SYNC_INTERVAL = "metaSyncInterval";
     public static final String CONFIG_FILE = "configFile";
     public static final String BROKER_NAME = "brokerName";
+    public static final String WITH_SINK = "withSink";
 
     /** 所有配置项 key（有序） */
     private static final Set<String> ALL_KEYS = new LinkedHashSet<>();
@@ -71,6 +72,7 @@ public class SourceConfig extends AbstractConfig {
         ALL_KEYS.add(META_SYNC_INTERVAL);
         ALL_KEYS.add(CONFIG_FILE);
         ALL_KEYS.add(BROKER_NAME);
+        ALL_KEYS.add(WITH_SINK);
 
         // 必填参数（需求 1 §1）
         REQUIRED_KEYS.add(SOURCE_NAMESRV);
@@ -90,6 +92,7 @@ public class SourceConfig extends AbstractConfig {
         DEFAULTS.put(PARSE_ERROR_SUSPEND_WINDOW_MS, "60000");
         DEFAULTS.put(META_SYNC_INTERVAL, "60000");
         DEFAULTS.put(BROKER_NAME, "broker-a");
+        DEFAULTS.put(WITH_SINK, "false");
     }
 
     // ==================== 快捷访问方法 ====================
@@ -150,6 +153,18 @@ public class SourceConfig extends AbstractConfig {
         return getLong(META_SYNC_INTERVAL, 60000L);
     }
 
+    /**
+     * 是否在 Source 同进程内嵌启动 Sink 实例
+     * <p>
+     * 指定 --with-sink 或 --withSink true 后，Source 启动时会在同一进程内
+     * 创建 Sink 实例，Sink 通过 localhost:{zmqPort} 连接 Source ZMQ Socket，
+     * 通信和服务发现逻辑与独立部署完全一致。
+     */
+    public boolean isWithSink() {
+        String value = getString(WITH_SINK);
+        return "true".equalsIgnoreCase(value) || "yes".equalsIgnoreCase(value);
+    }
+
     // ==================== 抽象方法实现 ====================
 
     @Override
@@ -204,6 +219,8 @@ public class SourceConfig extends AbstractConfig {
         System.err.println("  --parseErrorSuspendWindowMs <ms>      解析错误暂停窗口（默认: 60000）");
         System.err.println("  --metaSyncInterval <ms>               元数据同步间隔（默认: 60000）");
         System.err.println("  --configFile <path>                   配置文件路径（默认: ./ha-sync-source.properties）");
+        System.err.println("  --withSink <true|false>               是否同进程内嵌 Sink（默认: false）");
+        System.err.println("                                        指定后 Sink 通过 localhost ZMQ 连接 Source，通信逻辑与独立部署一致");
     }
 
     // ==================== 工具方法 ====================
