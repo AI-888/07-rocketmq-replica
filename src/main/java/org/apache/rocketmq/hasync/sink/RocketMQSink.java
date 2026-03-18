@@ -91,6 +91,14 @@ public class RocketMQSink implements SyncSink {
         this.queueSelector = new FixedQueueSelector();
         this.checkpointCoordinator = checkpointCoordinator;
         this.metricsCollector = metricsCollector;
+
+        // 将当前生效的 Topic 过滤白名单写入监控指标（需求 20 §5）
+        if (metricsCollector != null && topicFilter != null) {
+            String filterStr = topicFilter.isEnabled()
+                    ? String.join(",", topicFilter.getWhitelist())
+                    : "";
+            metricsCollector.setActiveTopicFilter(filterStr);
+        }
     }
 
     public void setWriteCallback(SinkWriteCallback writeCallback) {

@@ -44,7 +44,7 @@ public class MetadataSyncServiceTest {
     @Test
     public void testSyncAllSuccess() {
         service.syncAll();
-        assertEquals(5, syncCallCount); // 5 种元数据类型
+        assertEquals(6, syncCallCount); // 6 种元数据类型（含 TIMER_METRICS）
         assertTrue(service.getSyncSuccessCount() > 0);
         assertEquals(0, service.getSyncErrorCount());
     }
@@ -53,9 +53,9 @@ public class MetadataSyncServiceTest {
     public void testSyncAllFailure() {
         syncShouldFail = true;
         service.syncAll();
-        assertEquals(5, syncCallCount);
+        assertEquals(6, syncCallCount);
         assertEquals(0, service.getSyncSuccessCount());
-        assertEquals(5, service.getSyncErrorCount());
+        assertEquals(6, service.getSyncErrorCount());
     }
 
     @Test
@@ -104,11 +104,11 @@ public class MetadataSyncServiceTest {
     @Test
     public void testDataVersions() {
         service.syncAll();
-        assertEquals(5, service.getDataVersions().size());
+        assertEquals(6, service.getDataVersions().size());
     }
 
     @Test
     public void testMetadataTypes() {
-        assertEquals(5, MetadataSyncService.METADATA_TYPES.length);
+        assertEquals(6, MetadataSyncService.METADATA_TYPES.length);
     }
 }

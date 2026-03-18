@@ -116,6 +116,9 @@ public class MetricsCollector {
     /** 导致暂停的 Topic 名称 */
     private volatile String topicSyncFailedTopic = "";
 
+    /** 当前生效的 Topic 过滤白名单（需求 20 §5：Sink 侧同时包含 activeTopicFilter） */
+    private volatile String activeTopicFilter = "";
+
     // ==================== Pipeline 侧指标 ====================
 
     /** 每秒同步字节数 */
@@ -200,6 +203,7 @@ public class MetricsCollector {
         this.topicSyncSuspended = suspended;
         this.topicSyncFailedTopic = suspended ? topic : "";
     }
+    public void setActiveTopicFilter(String filter) { this.activeTopicFilter = filter; }
     public void setSyncBytesPerSecond(long bytes) { this.syncBytesPerSecond = bytes; }
     public void setQueueSize(int size) { this.queueSize = size; }
     public void setConfirmedOffset(long offset) { this.confirmedOffset = offset; }
@@ -249,6 +253,7 @@ public class MetricsCollector {
     public long getTopicSyncFailureCount() { return topicSyncFailureCount.get(); }
     public boolean isTopicSyncSuspended() { return topicSyncSuspended; }
     public String getTopicSyncFailedTopic() { return topicSyncFailedTopic; }
+    public String getActiveTopicFilter() { return activeTopicFilter; }
 
     public long getSyncBytesPerSecond() { return syncBytesPerSecond; }
     public int getQueueSize() { return queueSize; }
@@ -309,6 +314,7 @@ public class MetricsCollector {
         m.put("topicSyncFailureCount", topicSyncFailureCount.get());
         m.put("topicSyncSuspended", topicSyncSuspended);
         m.put("topicSyncFailedTopic", topicSyncFailedTopic);
+        m.put("activeTopicFilter", activeTopicFilter);
         return m;
     }
 
@@ -379,6 +385,7 @@ public class MetricsCollector {
         topicSyncFailureCount.set(0);
         topicSyncSuspended = false;
         topicSyncFailedTopic = "";
+        activeTopicFilter = "";
 
         syncBytesPerSecond = 0;
         queueSize = 0;

@@ -238,11 +238,12 @@ public class SyncPipeline {
      */
     public static SinkConfig buildEmbeddedSinkConfig(SourceConfig sourceConfig) {
         SinkConfig sinkConfig = new SinkConfig();
-        // Sink 配置继承 Source 的目标集群地址
-        // 实际连接时通过 NameServer KV 发现 Source ZMQ 地址
+        // Sink 配置继承 Source 的目标集群地址和源集群地址
+        // sourceNamesrv 用于 Sink 从源集群 NameServer KV 发现 Source ZMQ 地址
         // 由于 Source 已将 localhost:{zmqPort} 注册到 KV，Sink 自然连接到同进程 Source
         String[] args = new String[]{
                 "--targetNamesrv", sourceConfig.getTargetNamesrv(),
+                "--sourceNamesrv", sourceConfig.getSourceNamesrv(),
                 "--sinkId", "embedded-sink-" + sourceConfig.getSourceNodeId()
         };
         sinkConfig.load(args);

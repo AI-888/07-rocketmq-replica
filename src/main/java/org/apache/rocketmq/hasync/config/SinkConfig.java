@@ -28,6 +28,7 @@ public class SinkConfig extends AbstractConfig {
     // ==================== 配置项 Key 常量 ====================
 
     public static final String TARGET_NAMESRV = "targetNamesrv";
+    public static final String SOURCE_NAMESRV = "sourceNamesrv";
     public static final String SINK_METRICS_PORT = "sinkMetricsPort";
     public static final String SINK_ID = "sinkId";
     public static final String SINK_BATCH_SIZE = "sinkBatchSize";
@@ -50,6 +51,7 @@ public class SinkConfig extends AbstractConfig {
     static {
         // 注册所有配置项
         ALL_KEYS.add(TARGET_NAMESRV);
+        ALL_KEYS.add(SOURCE_NAMESRV);
         ALL_KEYS.add(SINK_METRICS_PORT);
         ALL_KEYS.add(SINK_ID);
         ALL_KEYS.add(SINK_BATCH_SIZE);
@@ -60,7 +62,8 @@ public class SinkConfig extends AbstractConfig {
         ALL_KEYS.add(TOPIC_SYNC_MAX_RETRY);
         ALL_KEYS.add(CONFIG_FILE);
 
-        // 必填参数（需求 1 §3）
+        // 必填参数（需求 1 §3：仅 targetNamesrv 必填）
+        // sourceNamesrv 在独立 Sink 模式下需要，但内嵌模式由 SourceBootstrap 自动注入，故不强制必填
         REQUIRED_KEYS.add(TARGET_NAMESRV);
 
         // 默认值（需求 1 §4）
@@ -78,6 +81,10 @@ public class SinkConfig extends AbstractConfig {
 
     public String getTargetNamesrv() {
         return getString(TARGET_NAMESRV);
+    }
+
+    public String getSourceNamesrv() {
+        return getString(SOURCE_NAMESRV);
     }
 
     public int getSinkMetricsPort() {
@@ -152,6 +159,7 @@ public class SinkConfig extends AbstractConfig {
         System.err.println("  --targetNamesrv <addr>    目标集群 NameServer 地址");
         System.err.println();
         System.err.println("可选参数:");
+        System.err.println("  --sourceNamesrv <addr>                源集群 NameServer 地址（独立模式下用于发现 Source ZMQ 地址，内嵌模式自动注入）");
         System.err.println("  --sinkMetricsPort <port>              HTTP 监控端口（默认: 9877）");
         System.err.println("  --sinkId <id>                         Sink 节点唯一标识（默认: hostname:pid）");
         System.err.println("  --sinkBatchSize <n>                   批量发送大小（默认: 100）");

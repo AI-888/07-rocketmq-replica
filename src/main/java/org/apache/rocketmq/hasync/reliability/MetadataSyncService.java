@@ -65,7 +65,8 @@ public class MetadataSyncService {
             "CONSUMER_OFFSET",
             "DELAY_OFFSET",
             "SUBSCRIPTION_GROUP",
-            "MESSAGE_REQUEST_MODE"
+            "MESSAGE_REQUEST_MODE",
+            "TIMER_METRICS"  // 需求 12 §1：仅当 timerWheelEnable=true 时同步，由 callback 实现判断
     };
 
     public MetadataSyncService(long syncInterval) {

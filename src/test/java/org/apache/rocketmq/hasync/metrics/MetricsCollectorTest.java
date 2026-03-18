@@ -265,7 +265,7 @@ public class MetricsCollectorTest {
         collector.setTargetClusterStatus("UNAVAILABLE");
 
         Map<String, Object> sink = collector.getSinkMetrics();
-        assertEquals(18, sink.size());
+        assertEquals(19, sink.size());
         assertEquals(2L, sink.get("syncSuccessCount"));
         assertEquals("UNAVAILABLE", sink.get("targetClusterStatus"));
     }
