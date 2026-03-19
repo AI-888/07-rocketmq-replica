@@ -56,6 +56,7 @@
 | 阶段五：可靠性增强 | 需求 14~17 | 异常处理、自动重试、目标不可写监控、优雅停机 |
 | 阶段六：分布式 & 高性能 | 需求 18~19 | Source 多实例 + Sink 分布式、全链路 Trace + 高 TPS |
 | 阶段七：可观测性 | 需求 20 | 监控指标 |
+| 阶段八：故障场景增强 | 需求 21 | 网络分区容错、拉取侧堆积隔离、动态限流与背压、写入侧梯度重试暂停、延迟消息同步、定时消息同步、ACL 权限预检、事务消息过滤、Prometheus 指标导出 |
 
 ---
 
@@ -737,6 +738,339 @@
    - IF `lagBytes` 持续 60 秒超过 100MB THEN 打印 **WARN** 日志，提示同步严重滞后
    - IF `checkpointFlushErrorCount` 在 60 秒内新增超过 3 次 THEN 打印 **ERROR** 日志，提示 Checkpoint 持久化异常，存在数据重复风险
    - IF `parseErrorSuspendStatus` 为 `PARSE_ERROR_SUSPENDED` THEN 每隔 30 秒打印 **ERROR** 日志，提示同步已暂停、暂停原因及已暂停时长，直到人工通过 `POST /resume` 恢复
+
+---
+
+## 阶段八：故障场景增强
+
+### 需求 21：故障场景增强
+
+**用户故事：** 作为一名运维人员，我希望数据同步组件在面对各类生产故障场景（网络分区、拉取侧堆积、写入侧梯度重试与暂停、ACL 权限、资源瓶颈、事务消息过滤、延迟消息同步、定时消息同步等）时，能够自动识别、隔离故障并执行恢复策略，最大限度减少人工干预，保证同步任务的可用性和数据一致性。
+
+> **说明**：本需求是对已有需求 14（异常处理）、需求 15（自动重试）、需求 16（目标不可写）等的**增强和补充**，覆盖更多生产环境中常见的故障场景，提供更精细化的故障处理策略。同步组件采用 **At-Least-Once** 语义保证最终一致性，不提供幂等写入机制。
+
+---
+
+#### 21.1 网络分区容错
+
+> **关联需求**：增强需求 14（异常处理策略）、需求 4（动态发现 Master 地址）
+
+**用户故事：** 作为一名运维人员，我希望在源集群与目标集群之间发生部分网络分区（只能连接到部分 Broker 或 NameServer）时，组件能自动感知拓扑变化并调整连接策略，避免因部分节点不可达而导致整体同步中断。
+
+##### 验收标准
+
+1. WHEN Source 启动时 THEN 系统 SHALL 配置多个 NameServer 地址（以 `;` 分隔），在单个 NameServer 不可达时自动切换到其他可用 NameServer 查询 Master 信息
+2. WHEN Source 拉取数据时检测到当前连接的 Master 不可达，但 NameServer 仍能查询到集群信息 THEN 系统 SHALL 优先选择 brokerId=0 的 Master Broker 进行连接；IF Master 不可达但存在已提升为新 Master 的节点 THEN 系统 SHALL 自动切换到新 Master
+3. WHEN Sink 向目标集群写入消息时检测到某个目标 Broker 不可达 THEN 系统 SHALL 启用自动故障转移（failover）：将消息暂时路由到目标集群中其他可用的相同 Topic 的 Broker，并记录 `brokerFailoverCount` 监控计数器加 1
+4. WHEN 目标集群中所有持有指定 Topic 的 Broker 均不可达 THEN 系统 SHALL 触发需求 16（目标不可写监控）的处理流程（标记 UNAVAILABLE + 探活）
+5. WHEN 组件运行时 THEN 系统 SHALL 启动一个后台定时任务（默认每 60 秒），监控源集群和目标集群的拓扑变化（通过 `GET_BROKER_CLUSTER_INFO` 接口），当检测到 Broker 上线/下线/角色变更时 THEN 系统 SHALL 打印 INFO 日志（"集群拓扑变化：{变化详情}"），并动态调整连接策略
+6. WHEN Source 和 Sink 运行时 THEN 系统 SHALL 在 `/metrics` 接口中新增以下网络分区相关指标：
+   - **brokerFailoverCount**：因 Broker 故障转移的累计次数
+   - **nameSrvSwitchCount**：因 NameServer 不可达而切换的累计次数
+   - **clusterTopologyChangeCount**：检测到集群拓扑变化的累计次数
+
+---
+
+#### 21.2 拉取侧堆积与 Queue 隔离
+
+> **关联需求**：增强需求 14（异常处理策略）、需求 19（高 TPS 保障）
+
+**用户故事：** 作为一名运维人员，我希望在源集群消息堆积导致同步延迟增大时，组件能动态调整拉取策略；当某个 Topic 或 Queue 出现异常时，能隔离异常数据避免阻塞整体同步进度。
+
+##### 验收标准
+
+1. WHEN Source 从 Master 拉取数据时检测到同步滞后量（`lagBytes`）持续 60 秒超过 500MB THEN 系统 SHALL 打印 WARN 日志，提示"同步严重滞后，当前 lag={lagBytes}MB"，并自动调大拉取批次大小至配置值的 2 倍（最大不超过 4 倍初始值），提高拉取效率
+2. WHEN `lagBytes` 恢复至 100MB 以下并持续 60 秒 THEN 系统 SHALL 将拉取批次大小恢复为初始配置值，打印 INFO 日志（"同步延迟已恢复正常，拉取批次大小已调回默认值"）
+3. WHEN Sink 写入某个 Topic 的消息**连续失败**超过 `--sinkMaxRetry` 次（默认 3）且错误原因为 Topic 维度的问题（如 Topic 不存在、权限不足等）THEN 系统 SHALL 将该 Topic 临时加入**隔离列表**，后续该 Topic 的消息直接跳过写入并发送到 RFQ，其他 Topic 的消息继续正常同步，不受影响
+4. WHEN Topic 被加入隔离列表后 THEN 系统 SHALL 每隔 60 秒自动尝试恢复：重新写入该 Topic 的一条消息，IF 成功 THEN 将该 Topic 从隔离列表移除，恢复正常写入，打印 INFO 日志
+5. WHEN 组件运行时 THEN 系统 SHALL 在 `/metrics` 接口中新增以下指标：
+   - **currentPullBatchMultiplier**：当前拉取批次放大倍数（默认 1.0，最大 4.0）
+   - **isolatedTopicCount**：当前被隔离的 Topic 数量
+   - **isolatedTopicList**：当前被隔离的 Topic 名称列表
+
+---
+
+#### 21.3 写入侧梯度重试与任务暂停
+
+> **关联需求**：增强需求 15（自动重试）、需求 16（目标不可写监控）
+
+**用户故事：** 作为一名运维人员，我希望在目标集群写入失败（Broker 宕机、磁盘满、超时等）时，组件能在梯度时间范围内自动重试，若所有重试均失败，则自动暂停同步任务并产生监控告警，等待人工干预恢复。
+
+##### 验收标准
+
+1. WHEN Sink 向目标集群写入消息失败时 THEN 系统 SHALL 启动**梯度退避重试**策略：
+   - 第 1 次重试：等待 1 秒
+   - 第 2 次重试：等待 3 秒
+   - 第 3 次重试：等待 10 秒
+   - 第 4 次重试：等待 30 秒
+   - 第 5 次重试：等待 60 秒
+   - 重试次数可通过 `--sinkGradientMaxRetry` 参数配置（默认 5），各级等待时间可通过 `--sinkGradientRetryDelays` 参数配置（默认 `1,3,10,30,60`，单位：秒）
+2. WHEN 梯度重试期间某次重试成功 THEN 系统 SHALL 将重试计数器归零，打印 INFO 日志（"目标集群写入在第 {n} 次重试后恢复成功"），`sinkGradientRetryRecoverCount` 计数器加 1，继续正常同步
+3. WHEN 梯度重试全部耗尽（所有重试均失败）THEN 系统 SHALL 执行以下操作：
+   - 将 Sink 同步任务状态标记为 **SUSPENDED**
+   - 停止从 Source 拉取新数据
+   - 打印 **ERROR** 日志（"目标集群写入持续失败，梯度重试 {n} 次全部耗尽，同步任务已暂停。最后错误：{errorMsg}。请检查目标集群状态后通过 POST /resume 恢复"）
+   - `sinkSuspendCount` 计数器加 1
+4. WHEN Sink 任务处于 `SUSPENDED` 状态时 THEN 系统 SHALL 每隔 30 秒打印一次 **ERROR** 日志（"同步任务已暂停：原因={lastError}，暂停时长={duration}秒，请通过 POST /resume 恢复"）
+5. WHEN 运维人员通过 `POST /resume` 接口恢复 Sink 时 THEN 系统 SHALL 将 Sink 状态从 `SUSPENDED` 恢复为 `RUNNING`，重置重试计数器，重新从 Source 拉取数据并写入目标集群，打印 INFO 日志（"同步任务已手动恢复"）
+6. WHEN 组件运行时 THEN 系统 SHALL 在 `/metrics` 接口中新增以下指标：
+   - **sinkSuspended**：Sink 当前是否处于暂停状态（boolean）
+   - **sinkSuspendCount**：Sink 因梯度重试耗尽而暂停的累计次数
+   - **sinkSuspendDurationSeconds**：Sink 当前暂停持续时长（秒，非暂停状态为 0）
+   - **sinkGradientRetryCount**：梯度重试的累计触发次数
+   - **sinkGradientRetryRecoverCount**：梯度重试成功恢复的累计次数
+   - **sinkLastRetryLevel**：最近一次梯度重试所处的级别（1~5）
+
+**Sink 新增启动参数：**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--sinkGradientMaxRetry <n>` | `5` | 梯度重试最大次数 |
+| `--sinkGradientRetryDelays <delays>` | `1,3,10,30,60` | 各级重试等待时间（秒，逗号分隔） |
+
+---
+
+#### 21.4 延迟消息同步
+
+> **关联需求**：增强需求 7（消息完整性与顺序）
+
+**用户故事：** 作为一名开发者，我希望同步组件能识别源集群中的延迟消息（写入 `SCHEDULE_TOPIC_XXXX` 的消息），解析出原始投递信息，并在目标集群以延迟消息形式重新投递，保证延迟消息在目标集群也能按预期延迟时间被消费。
+
+##### 验收标准
+
+1. WHEN CommitLogParser 解析消息时检测到消息的 Topic 为 `SCHEDULE_TOPIC_XXXX`（RocketMQ 延迟消息内部 Topic）THEN 系统 SHALL 识别为延迟消息，并从消息属性中解析出以下信息：
+   - **原始 Topic**：`REAL_TOPIC` 属性
+   - **原始 QueueId**：`REAL_QID` 属性
+   - **延迟级别**：`DELAY` 属性（对应 `delayTimeLevel`，如 1=1s, 2=5s, 3=10s, ...，共 18 个级别）
+2. WHEN 延迟消息解析成功后 THEN 系统 SHALL 产出 `SyncRecord`，其中：
+   - `topic` 字段设置为**原始 Topic**（而非 `SCHEDULE_TOPIC_XXXX`）
+   - `queueId` 字段设置为**原始 QueueId**
+   - 消息属性中保留 `DELAY` 标记和 `delayTimeLevel` 值
+   - `syncRecordType` 标记为 `DELAY_MESSAGE`
+3. WHEN Sink 写入延迟消息到目标集群时 THEN 系统 SHALL 使用 RocketMQ Producer 的 `setDelayTimeLevel(int level)` 方法设置延迟级别，确保消息在目标集群按照相同的延迟时间被投递到消费者
+4. WHEN 延迟消息的原始 Topic 不在 `--activeTopicFilter` 白名单中（如已配置）THEN 系统 SHALL 跳过该延迟消息，不同步到目标集群
+5. WHEN 延迟消息解析失败（缺少 `REAL_TOPIC` 或 `REAL_QID` 属性）THEN 系统 SHALL 将该消息发送到 RFQ（需求 13），并打印 WARN 日志（"延迟消息解析失败，缺少必要属性：offset={offset}"），`delayMsgParseErrorCount` 计数器加 1
+6. WHEN 组件运行时 THEN 系统 SHALL 在 `/metrics` 接口中新增以下指标：
+   - **delayMsgSyncCount**：已同步的延迟消息总数
+   - **delayMsgParseErrorCount**：延迟消息解析失败的总数
+   - **delayMsgSkipCount**：因 Topic 过滤跳过的延迟消息总数
+
+---
+
+#### 21.5 定时消息同步
+
+> **关联需求**：增强需求 7（消息完整性与顺序）
+
+**用户故事：** 作为一名开发者，我希望同步组件能识别源集群中的定时消息（RocketMQ 5.x `TIMER_TOPIC` 或带有 `__STARTDELIVERTIME` 属性的消息），并在目标集群以定时消息形式重新投递，保证消息按照原始定时时间在目标集群被投递到消费者。
+
+> **说明**：定时消息与延迟消息的区别——延迟消息基于固定的延迟级别（如延迟 10 秒），而定时消息基于精确的投递时间戳（如 2026-03-20 10:00:00）。两者在 CommitLog 中的存储方式不同，需要分别处理。
+
+##### 验收标准
+
+1. WHEN CommitLogParser 解析消息时检测到以下任一条件 THEN 系统 SHALL 识别为定时消息：
+   - 消息的 Topic 为 `rmq_sys_wheel_timer`（RocketMQ 5.x TimerWheel 系统 Topic）
+   - 消息属性中包含 `__STARTDELIVERTIME`（精确投递时间戳，Unix 毫秒）
+2. WHEN 定时消息来自 `rmq_sys_wheel_timer` Topic 时 THEN 系统 SHALL 从消息属性中解析出：
+   - **原始 Topic**：`REAL_TOPIC` 属性
+   - **原始 QueueId**：`REAL_QID` 属性
+   - **定时投递时间**：`__STARTDELIVERTIME` 属性（Unix 毫秒时间戳）
+3. WHEN 定时消息解析成功后 THEN 系统 SHALL 产出 `SyncRecord`，其中：
+   - `topic` 字段设置为**原始 Topic**（而非系统 Topic）
+   - `queueId` 字段设置为**原始 QueueId**
+   - 消息属性中保留 `__STARTDELIVERTIME` 时间戳
+   - `syncRecordType` 标记为 `TIMER_MESSAGE`
+4. WHEN Sink 写入定时消息到目标集群时 THEN 系统 SHALL 在消息属性中设置 `__STARTDELIVERTIME` 为原始投递时间戳：
+   - IF 原始投递时间 > 当前时间 THEN 保持原始时间戳不变，消息将在目标集群按原定时间投递
+   - IF 原始投递时间 ≤ 当前时间（已过期）THEN 消息将被目标集群立即投递（作为普通消息处理），打印 DEBUG 日志（"定时消息已过期，将立即投递：topic={topic}, originalDeliverTime={time}"）
+5. WHEN 定时消息的原始 Topic 不在 `--activeTopicFilter` 白名单中（如已配置）THEN 系统 SHALL 跳过该定时消息
+6. WHEN 定时消息解析失败（缺少 `REAL_TOPIC`、`REAL_QID` 或 `__STARTDELIVERTIME` 属性）THEN 系统 SHALL 将该消息发送到 RFQ，打印 WARN 日志，`timerMsgParseErrorCount` 计数器加 1
+7. WHEN 组件运行时 THEN 系统 SHALL 在 `/metrics` 接口中新增以下指标：
+   - **timerMsgSyncCount**：已同步的定时消息总数
+   - **timerMsgExpiredCount**：已过期（立即投递）的定时消息总数
+   - **timerMsgParseErrorCount**：定时消息解析失败的总数
+
+---
+
+#### 21.6 ACL 权限预检
+
+> **关联需求**：新增，与需求 5（启动兼容性预校验）同阶段
+
+**用户故事：** 作为一名运维人员，我希望在组件启动时自动检测对源集群和目标集群的读写权限，如果权限不足则提前明确告警并退出，避免同步运行过程中因权限问题导致静默失败。
+
+##### 验收标准
+
+1. WHEN Source 启动并连接到源集群后 THEN 系统 SHALL 执行源集群权限预检：
+   - 尝试通过 NameServer 查询集群信息（`GET_BROKER_CLUSTER_INFO`），验证 NameServer 读权限
+   - 尝试读取 Source 注册 KV（`GET_KV_CONFIG`，namespace: `SYNC_SOURCE_CONFIG`），验证 KV 读写权限
+   - 尝试向 RFQ Topic 发送一条探测消息（Tag 标记为 `ACL_PROBE`），验证源集群 Producer 写权限
+2. WHEN Sink 启动并连接到目标集群后 THEN 系统 SHALL 执行目标集群权限预检：
+   - 尝试通过 NameServer 查询目标集群 Topic 列表，验证 NameServer 读权限
+   - 尝试向目标集群的探活 Topic（`ha-sync-probe`）发送一条探测消息，验证 Producer 写权限
+   - 尝试读取 Checkpoint KV（`GET_KV_CONFIG`，namespace: `SYNC_CHECKPOINT`），验证 KV 读写权限
+3. WHEN 权限预检**全部通过**时 THEN 系统 SHALL 打印 INFO 日志（"权限预检通过：源集群读权限 ✓，源集群写权限 ✓，目标集群写权限 ✓"），继续正常启动
+4. WHEN 权限预检中任何一项**失败**时 THEN 系统 SHALL 打印 **ERROR** 日志（"权限预检失败：{失败项描述}，请检查 ACL 配置"），包含失败的具体操作、返回的错误码和建议修复步骤，并**以非零退出码退出进程**
+5. WHEN 启动参数中指定了 `--skipAclCheck true`（默认 `false`）THEN 系统 SHALL 跳过权限预检，打印 WARN 日志（"已跳过权限预检，如遇权限问题请检查 ACL 配置"）
+
+**Source 和 Sink 新增启动参数：**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--skipAclCheck` | `false` | 是否跳过 ACL 权限预检 |
+| `--aclAccessKey <key>` | （空） | ACL 访问密钥（如需） |
+| `--aclSecretKey <key>` | （空） | ACL 密钥（如需） |
+
+---
+
+#### 21.7 资源保护与背压机制
+
+> **关联需求**：增强需求 19（高 TPS 保障）
+
+**用户故事：** 作为一名运维人员，我希望同步组件自身具有资源保护能力（防止 OOM、CPU 过载），在 Sink 处理速度跟不上 Source 拉取速度时能自动触发背压，动态调节拉取速率，并支持主动限流以降低对源/目标集群的压力。
+
+##### 验收标准
+
+**内存缓冲区保护：**
+
+1. WHEN Source 的内存缓冲区（SyncRecord 缓存）大小达到上限（通过 `--sourceBufferCapacity` 配置，默认 10,000 条）THEN 系统 SHALL 停止从 Master 拉取新数据（阻塞 poll），直到 Sink 消费使缓冲区低于 80% 水位后恢复拉取
+2. WHEN Source 内存缓冲区使用率超过 80% 持续 10 秒 THEN 系统 SHALL 打印 WARN 日志（"内存缓冲区积压告警：当前使用率 {usage}%，建议增加 Sink 线程数或 Sink 节点数"），对应需求 19 §8 的增强
+
+**动态限流（Rate Limiter）：**
+
+3. WHEN Source 启动参数中指定了 `--sourceMaxTps <n>`（默认 0，表示不限制）THEN 系统 SHALL 限制 Source 每秒从 Master 接收的最大消息条数，超过限制时主动降低 slaveMaxOffset 的上报频率，使 Master 放缓数据推送
+4. WHEN Sink 启动参数中指定了 `--sinkMaxTps <n>`（默认 0，表示不限制）THEN 系统 SHALL 限制 Sink 每秒向目标集群写入的最大消息条数，使用令牌桶算法（Token Bucket）平滑限流
+5. WHEN 限流生效时 THEN 系统 SHALL 在 `/metrics` 接口中新增以下指标：
+   - **sourceThrottled**：Source 是否正在被限流（boolean）
+   - **sinkThrottled**：Sink 是否正在被限流（boolean）
+   - **sourceThrottledDurationSeconds**：Source 累计被限流的时长（秒）
+   - **sinkThrottledDurationSeconds**：Sink 累计被限流的时长（秒）
+
+**JVM 资源监控：**
+
+6. WHEN 组件运行时 THEN 系统 SHALL 在 `/metrics` 接口中新增以下 JVM 资源指标：
+   - **jvmHeapUsedMB**：JVM 堆内存使用量（MB）
+   - **jvmHeapMaxMB**：JVM 堆内存上限（MB）
+   - **jvmGcPauseMs**：最近一次 GC 暂停时间（ms）
+   - **processCpuUsagePercent**：进程 CPU 使用率（百分比）
+7. WHEN `jvmHeapUsedMB` 超过 `jvmHeapMaxMB` 的 85% THEN 系统 SHALL 打印 WARN 日志（"JVM 堆内存使用率过高：{usage}%，建议增大 -Xmx 或减少缓冲区大小"），并主动触发一次 GC（`System.gc()`，仅建议）
+
+**Source 和 Sink 新增启动参数：**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--sourceBufferCapacity <n>` | `10000` | Source 内存缓冲区最大 SyncRecord 条数 |
+| `--sourceMaxTps <n>` | `0`（不限制） | Source 每秒最大拉取消息条数 |
+| `--sinkMaxTps <n>` | `0`（不限制） | Sink 每秒最大写入消息条数 |
+
+---
+
+#### 21.8 事务消息过滤（不支持同步）
+
+> **关联需求**：新增，与需求 7（消息完整性与顺序）相关
+
+**用户故事：** 作为一名开发者，我需要明确知道同步组件**不支持**事务消息的同步。当 CommitLogParser 识别到事务消息时，应自动跳过，避免将事务中间状态的消息（Half Message / Op Message）同步到目标集群导致数据不一致。
+
+> **设计决策说明**：事务消息依赖源集群本地事务状态机（事务回查机制），其状态与源集群的 Broker 紧耦合，无法在目标集群还原。因此同步组件选择**不同步事务消息**，业务方如需跨集群事务一致性，应在应用层完成事务后再投递普通消息。
+
+##### 验收标准
+
+1. WHEN CommitLogParser 解析消息时检测到消息的 Topic 为 `RMQ_SYS_TRANS_HALF_TOPIC`（事务 Half 消息）或 `RMQ_SYS_TRANS_OP_HALF_TOPIC`（事务 Op 消息）THEN 系统 SHALL **跳过**这些消息，不产出 `SyncRecord`，`transactionMsgSkipCount` 计数器加 1，打印 DEBUG 日志（"跳过事务消息：topic={topic}, offset={offset}"）
+2. WHEN CommitLogParser 解析消息时检测到消息属性中包含 `TRAN_MSG=true` 且 Topic 不是系统内部事务 Topic THEN 系统 SHALL 视为**已提交的事务消息**（已写入真实 Topic），正常产出 `SyncRecord`，作为普通消息同步
+3. WHEN 组件运行时 THEN 系统 SHALL 在 `/metrics` 接口中新增以下指标：
+   - **transactionMsgSkipCount**：因事务消息策略跳过的消息条数
+
+---
+
+#### 21.9 Prometheus 指标导出
+
+> **关联需求**：增强需求 20（监控指标采集）
+
+**用户故事：** 作为一名运维人员，我希望组件除了提供 JSON 格式的 `/metrics` 接口外，还能提供 Prometheus 标准格式的指标导出接口，以便集成到已有的 Prometheus + Grafana 监控体系。
+
+##### 验收标准
+
+1. WHEN 组件运行时 THEN 系统 SHALL 在 Source 和 Sink 的 HTTP 监控端口上额外提供 `GET /metrics/prometheus` 接口，返回 Prometheus exposition format（text/plain）格式的全部指标
+2. WHEN 输出 Prometheus 格式时 THEN 系统 SHALL 遵循 Prometheus 命名规范：
+   - 所有指标名称添加 `ha_sync_` 前缀
+   - 指标名称使用 snake_case 命名（如 `ha_sync_connection_status`、`ha_sync_sync_success_count_total`）
+   - Counter 类型指标后缀添加 `_total`
+   - 每个指标携带 `role="source"` 或 `role="sink"` 标签
+   - 每个指标携带 `node_id="{sourceNodeId}"` 或 `node_id="{sinkId}"` 标签
+3. WHEN 输出 Prometheus 格式时 THEN 系统 SHALL 包含 `# HELP` 和 `# TYPE` 注释行，说明每个指标的用途和类型
+4. WHEN 启动参数中指定了 `--prometheusEnabled false`（默认 `true`）THEN 系统 SHALL 禁用 Prometheus 接口
+
+**Source 和 Sink 新增启动参数：**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--prometheusEnabled` | `true` | 是否启用 Prometheus 格式指标接口 |
+
+---
+
+#### 21.10 需求 21 监控指标汇总
+
+以下为需求 21 新增的全部监控指标，统一纳入 `MetricsCollector` 管理：
+
+**网络分区指标（§21.1）：**
+
+| 指标名称 | 类型 | 说明 |
+|---------|------|------|
+| `brokerFailoverCount` | Counter | 因 Broker 故障转移的累计次数 |
+| `nameSrvSwitchCount` | Counter | 因 NameServer 不可达而切换的累计次数 |
+| `clusterTopologyChangeCount` | Counter | 检测到集群拓扑变化的累计次数 |
+
+**拉取侧堆积指标（§21.2）：**
+
+| 指标名称 | 类型 | 说明 |
+|---------|------|------|
+| `currentPullBatchMultiplier` | Gauge | 当前拉取批次放大倍数（1.0~4.0） |
+| `isolatedTopicCount` | Gauge | 当前被隔离的 Topic 数量 |
+| `isolatedTopicList` | Gauge | 当前被隔离的 Topic 名称列表 |
+
+**写入侧梯度重试暂停指标（§21.3）：**
+
+| 指标名称 | 类型 | 说明 |
+|---------|------|------|
+| `sinkSuspended` | Gauge | Sink 是否处于暂停状态 |
+| `sinkSuspendCount` | Counter | 梯度重试耗尽导致暂停的累计次数 |
+| `sinkSuspendDurationSeconds` | Gauge | 当前暂停持续时长（秒） |
+| `sinkGradientRetryCount` | Counter | 梯度重试触发的累计次数 |
+| `sinkGradientRetryRecoverCount` | Counter | 梯度重试成功恢复的累计次数 |
+| `sinkLastRetryLevel` | Gauge | 最近一次梯度重试所处的级别 |
+
+**延迟消息同步指标（§21.4）：**
+
+| 指标名称 | 类型 | 说明 |
+|---------|------|------|
+| `delayMsgSyncCount` | Counter | 已同步的延迟消息总数 |
+| `delayMsgParseErrorCount` | Counter | 延迟消息解析失败的总数 |
+| `delayMsgSkipCount` | Counter | 因 Topic 过滤跳过的延迟消息总数 |
+
+**定时消息同步指标（§21.5）：**
+
+| 指标名称 | 类型 | 说明 |
+|---------|------|------|
+| `timerMsgSyncCount` | Counter | 已同步的定时消息总数 |
+| `timerMsgExpiredCount` | Counter | 已过期（立即投递）的定时消息总数 |
+| `timerMsgParseErrorCount` | Counter | 定时消息解析失败的总数 |
+
+**资源保护指标（§21.7）：**
+
+| 指标名称 | 类型 | 说明 |
+|---------|------|------|
+| `sourceThrottled` | Gauge | Source 是否被限流 |
+| `sinkThrottled` | Gauge | Sink 是否被限流 |
+| `sourceThrottledDurationSeconds` | Counter | Source 累计限流时长 |
+| `sinkThrottledDurationSeconds` | Counter | Sink 累计限流时长 |
+| `jvmHeapUsedMB` | Gauge | JVM 堆内存使用量（MB） |
+| `jvmHeapMaxMB` | Gauge | JVM 堆内存上限（MB） |
+| `jvmGcPauseMs` | Gauge | 最近一次 GC 暂停时间 |
+| `processCpuUsagePercent` | Gauge | 进程 CPU 使用率 |
+
+**事务消息指标（§21.8）：**
+
+| 指标名称 | 类型 | 说明 |
+|---------|------|------|
+| `transactionMsgSkipCount` | Counter | 事务消息跳过条数 |
 
 ---
 

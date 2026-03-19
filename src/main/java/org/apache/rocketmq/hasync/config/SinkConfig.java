@@ -38,6 +38,8 @@ public class SinkConfig extends AbstractConfig {
     public static final String STARTUP_CHECK_MSG_COUNT = "startupCheckMsgCount";
     public static final String TOPIC_SYNC_MAX_RETRY = "topicSyncMaxRetry";
     public static final String CONFIG_FILE = "configFile";
+    public static final String SINK_GRADIENT_MAX_RETRY = "sinkGradientMaxRetry";
+    public static final String SINK_GRADIENT_RETRY_DELAYS = "sinkGradientRetryDelays";
 
     /** 所有配置项 key（有序） */
     private static final Set<String> ALL_KEYS = new LinkedHashSet<>();
@@ -61,6 +63,8 @@ public class SinkConfig extends AbstractConfig {
         ALL_KEYS.add(STARTUP_CHECK_MSG_COUNT);
         ALL_KEYS.add(TOPIC_SYNC_MAX_RETRY);
         ALL_KEYS.add(CONFIG_FILE);
+        ALL_KEYS.add(SINK_GRADIENT_MAX_RETRY);
+        ALL_KEYS.add(SINK_GRADIENT_RETRY_DELAYS);
 
         // 必填参数（需求 1 §3：仅 targetNamesrv 必填）
         // sourceNamesrv 在独立 Sink 模式下需要，但内嵌模式由 SourceBootstrap 自动注入，故不强制必填
@@ -75,6 +79,8 @@ public class SinkConfig extends AbstractConfig {
         DEFAULTS.put(TARGET_PROBE_INTERVAL, "30000");
         DEFAULTS.put(STARTUP_CHECK_MSG_COUNT, "10");
         DEFAULTS.put(TOPIC_SYNC_MAX_RETRY, "3");
+        DEFAULTS.put(SINK_GRADIENT_MAX_RETRY, "5");
+        DEFAULTS.put(SINK_GRADIENT_RETRY_DELAYS, "1,3,10,30,60");
     }
 
     // ==================== 快捷访问方法 ====================
@@ -117,6 +123,20 @@ public class SinkConfig extends AbstractConfig {
 
     public int getTopicSyncMaxRetry() {
         return getInt(TOPIC_SYNC_MAX_RETRY, 3);
+    }
+
+    /**
+     * 获取梯度重试最大次数（需求 21 §21.3）
+     */
+    public int getSinkGradientMaxRetry() {
+        return getInt(SINK_GRADIENT_MAX_RETRY, 5);
+    }
+
+    /**
+     * 获取梯度重试各级等待时间字符串（需求 21 §21.3）
+     */
+    public String getSinkGradientRetryDelays() {
+        return getString(SINK_GRADIENT_RETRY_DELAYS);
     }
 
     // ==================== 抽象方法实现 ====================
@@ -168,6 +188,8 @@ public class SinkConfig extends AbstractConfig {
         System.err.println("  --targetProbeInterval <ms>            目标集群探活间隔（默认: 30000）");
         System.err.println("  --startupCheckMsgCount <n>            启动校验消息条数（默认: 10，0=跳过）");
         System.err.println("  --topicSyncMaxRetry <n>               Topic 同步最大重试次数（默认: 3）");
+        System.err.println("  --sinkGradientMaxRetry <n>            梯度重试最大次数（默认: 5）（需求 21 §21.3）");
+        System.err.println("  --sinkGradientRetryDelays <delays>    各级重试等待时间，逗号分隔秒数（默认: 1,3,10,30,60）");
         System.err.println("  --configFile <path>                   配置文件路径（默认: ./ha-sync-sink.properties）");
     }
 

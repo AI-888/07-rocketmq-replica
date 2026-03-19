@@ -1,6 +1,6 @@
 # RocketMQ HA 数据同步组件 — 技术设计文档
 
-> **文档版本**：v2.0 | **最后更新**：2026-03-17 | **作者**：HA Sync Team  
+> **文档版本**：v3.0 | **最后更新**：2026-03-19 | **作者**：HA Sync Team  
 > **关联需求文档**：[requirements.md](doc/ha-data-sync/requirements.md)
 
 ---
@@ -23,6 +23,7 @@
 | 12 | 测试策略 | — |
 | 13 | 部署架构 | — |
 | 14 | 运维指南 | 需求 17、20 |
+| 15 | 故障场景增强设计 | 需求 21 |
 | 附录 | 术语表、参考文档 | — |
 
 ---
@@ -50,6 +51,7 @@ RocketMQ HA 数据同步组件是一个**独立的 Java 程序**，模拟 Rocket
 | **自动重试** | 网络抖动容错，指数退避重试 | 需求 15 |
 | **元数据同步** | 全量元数据 + Topic 按需同步 | 需求 12 |
 | **解析失败 RFQ** | 解析失败消息写入源集群 RFQ Topic，不丢原始数据 | 需求 13 |
+| **故障场景增强** | 网络分区容错、拉取侧堆积隔离、写入梯度重试暂停、延迟消息同步、定时消息同步、ACL 预检、背压限流、事务消息过滤、Prometheus 导出 | 需求 21 |
 
 ### 1.3 适用场景
 
@@ -69,6 +71,7 @@ RocketMQ HA 数据同步组件是一个**独立的 Java 程序**，模拟 Rocket
 | 阶段五：可靠性增强 | 需求 14~17 | 第 7 章 |
 | 阶段六：分布式 & 高性能 | 需求 18~19 | 第 9 章 |
 | 阶段七：可观测性 | 需求 20 | 第 8 章 |
+| 阶段八：故障场景增强 | 需求 21 | 第 15 章 |
 
 ---
 
@@ -3591,6 +3594,1063 @@ CMD ["--configFile=/app/ha-sync-source.properties"]
 
 ---
 
+## 15. 故障场景增强设计
+
+> **对应需求**：需求 21（故障场景增强）
+
+本章是对第 7 章（异常处理设计）、第 8 章（监控指标设计）、第 9 章（性能优化策略）的增强补充，覆盖更多生产环境中常见的故障场景，提供更精细化的故障处理策略。
+
+### 15.1 故障场景全景图
+
+```mermaid
+graph TD
+    subgraph "一、网络相关故障"
+        F1[源集群与目标集群网络中断] -->|"已有：需求14+16"| E1[重试+探活+断点续传]
+        F2[部分网络分区] -->|"新增：§21.1"| E2[NameServer切换+Broker故障转移+拓扑监控]
+    end
+
+    subgraph "二、消息拉取侧故障"
+        F3[源集群消息堆积/拉取失败] -->|"新增：§21.2"| E3[动态批次调整+Queue隔离]
+        F4[消息格式兼容性问题] -->|"已有：需求5+7+13"| E4[预校验+完整性校验+RFQ]
+    end
+
+    subgraph "三、消息写入侧故障"
+        F5[目标集群写入失败] -->|"新增：§21.3"| E5[梯度重试+任务暂停+监控告警]
+        F6[消息重复写入] -->|"At-Least-Once"| E6[最终一致性保证，不做幂等]
+    end
+
+    subgraph "四、元数据与配置不一致"
+        F7[Topic/Queue数量不一致] -->|"已有：需求12"| E7[元数据全量同步+按需Topic同步]
+        F8[ACL权限配置差异] -->|"新增：§21.6"| E8[启动权限预检+ACL配置]
+    end
+
+    subgraph "五、系统资源与性能瓶颈"
+        F9[同步工具自身OOM/CPU过载] -->|"新增：§21.7"| E9[缓冲区保护+背压+JVM监控]
+        F10[源/目标集群负载过高] -->|"新增：§21.7"| E10[动态限流+令牌桶]
+    end
+
+    subgraph "六、数据一致性与特殊消息"
+        F11[顺序消息乱序] -->|"已有：需求2§6a-6f"| E11[physicOffset严格升序+FixedQueueSelector]
+        F12[事务消息] -->|"新增：§21.8"| E12[不支持同步，直接跳过]
+        F14[延迟消息] -->|"新增：§21.4"| E14[解析延迟级别+目标集群延迟投递]
+        F15[定时消息] -->|"新增：§21.5"| E15[解析定时时间+目标集群定时投递]
+    end
+
+    subgraph "七、运维与可观测性"
+        F13[缺乏监控与告警] -->|"新增：§21.9"| E13[Prometheus指标导出]
+    end
+```
+
+### 15.2 网络分区容错设计
+
+> **对应需求**：需求 21 §21.1
+
+#### 15.2.1 NameServer 自动切换
+
+```java
+/**
+ * 增强型 NameServer 客户端 — 支持多 NameServer 自动切换
+ * 在单个 NameServer 不可达时自动切换到其他可用 NameServer
+ */
+public class ResilientNameSrvClient {
+    private final List<String> nameSrvAddrs;     // 所有 NameServer 地址
+    private volatile int currentIndex = 0;        // 当前使用的 NameServer 索引
+    private final MetricsCollector metricsCollector;
+    
+    /**
+     * 带故障转移的 NameServer 查询
+     * 当前 NameServer 不可达时，自动切换到下一个
+     */
+    public <T> T queryWithFailover(Function<String, T> queryFn) {
+        int startIndex = currentIndex;
+        int tried = 0;
+        
+        while (tried < nameSrvAddrs.size()) {
+            String addr = nameSrvAddrs.get(currentIndex % nameSrvAddrs.size());
+            try {
+                return queryFn.apply(addr);
+            } catch (RemotingConnectException | RemotingTimeoutException e) {
+                log.warn("NameServer {} 不可达，切换到下一个", addr);
+                metricsCollector.incrementNameSrvSwitchCount();
+                currentIndex = (currentIndex + 1) % nameSrvAddrs.size();
+                tried++;
+            }
+        }
+        throw new AllNameSrvUnavailableException("所有 NameServer 均不可达");
+    }
+}
+```
+
+#### 15.2.2 Broker 故障转移（Sink 侧）
+
+```java
+/**
+ * Sink 写入时 Broker 故障转移
+ * 当目标 Broker 不可达时，尝试将消息路由到同 Topic 的其他可用 Broker
+ */
+public class BrokerFailoverStrategy {
+    
+    /**
+     * 带故障转移的消息发送
+     * 优先发送到原始 queueId 对应的 Broker
+     * 失败后尝试同 Topic 的其他 Broker
+     */
+    public SendResult sendWithFailover(DefaultMQProducer producer, 
+            Message msg, int targetQueueId) throws Exception {
+        
+        // 1. 尝试原始目标 Broker
+        try {
+            return producer.send(msg, new FixedQueueSelector(), targetQueueId);
+        } catch (RemotingConnectException | MQBrokerException e) {
+            log.warn("原始 Broker 不可达，启用故障转移: topic={}, queueId={}", 
+                msg.getTopic(), targetQueueId);
+        }
+        
+        // 2. 故障转移：选择同 Topic 其他可用 Queue/Broker
+        List<MessageQueue> availableQueues = producer.fetchPublishMessageQueues(
+            msg.getTopic());
+        
+        for (MessageQueue mq : availableQueues) {
+            if (mq.getQueueId() == targetQueueId) continue; // 跳过已失败的
+            try {
+                SendResult result = producer.send(msg, (mqs, m, arg) -> mq, null);
+                metricsCollector.incrementBrokerFailoverCount();
+                log.info("Broker 故障转移成功: topic={}, 原queueId={}, 转移到 {}",
+                    msg.getTopic(), targetQueueId, mq);
+                return result;
+            } catch (Exception ignored) {
+                // 继续尝试下一个
+            }
+        }
+        
+        // 3. 所有 Broker 都不可达 → 触发目标不可写流程（需求 16）
+        throw new AllBrokerUnavailableException(
+            "Topic " + msg.getTopic() + " 所有 Broker 均不可达");
+    }
+}
+```
+
+#### 15.2.3 集群拓扑监控
+
+```java
+/**
+ * 集群拓扑变化监控任务（每 60 秒执行一次）
+ * 监控源集群和目标集群的 Broker 上线/下线/角色变更
+ */
+public class ClusterTopologyMonitor {
+    private volatile ClusterInfo lastSourceCluster;
+    private volatile ClusterInfo lastTargetCluster;
+    
+    public void checkTopologyChange() {
+        ClusterInfo currentSource = queryClusterInfo(sourceNamesrv);
+        ClusterInfo currentTarget = queryClusterInfo(targetNamesrv);
+        
+        if (!currentSource.equals(lastSourceCluster)) {
+            String diff = computeDiff(lastSourceCluster, currentSource);
+            log.info("源集群拓扑变化: {}", diff);
+            metricsCollector.incrementClusterTopologyChangeCount();
+            lastSourceCluster = currentSource;
+        }
+        
+        if (!currentTarget.equals(lastTargetCluster)) {
+            String diff = computeDiff(lastTargetCluster, currentTarget);
+            log.info("目标集群拓扑变化: {}", diff);
+            metricsCollector.incrementClusterTopologyChangeCount();
+            lastTargetCluster = currentTarget;
+        }
+    }
+}
+```
+
+### 15.3 拉取侧堆积与 Queue 隔离设计
+
+> **对应需求**：需求 21 §21.2
+
+#### 15.3.1 动态批次调整
+
+```java
+/**
+ * 自适应拉取批次大小控制器
+ * 当同步严重滞后时自动调大批次，恢复后调回默认值
+ */
+public class AdaptivePullBatchController {
+    private final long lagThresholdHigh = 500 * 1024 * 1024L; // 500MB
+    private final long lagThresholdLow = 100 * 1024 * 1024L;  // 100MB
+    private final int baseBatchSize;
+    private volatile double multiplier = 1.0;
+    private volatile long lagExceedStartTime = 0;
+    private volatile long lagRecoverStartTime = 0;
+    
+    /**
+     * 根据当前 lagBytes 动态调整批次倍数
+     * - lagBytes > 500MB 持续 60s → 倍数翻倍（最大 4 倍）
+     * - lagBytes < 100MB 持续 60s → 恢复为 1 倍
+     */
+    public int getCurrentBatchSize(long lagBytes) {
+        long now = System.currentTimeMillis();
+        
+        if (lagBytes > lagThresholdHigh) {
+            lagRecoverStartTime = 0;
+            if (lagExceedStartTime == 0) {
+                lagExceedStartTime = now;
+            } else if (now - lagExceedStartTime > 60_000 && multiplier < 4.0) {
+                multiplier = Math.min(multiplier * 2, 4.0);
+                log.warn("同步严重滞后，lag={}MB，拉取批次放大至 {}x",
+                    lagBytes / 1024 / 1024, multiplier);
+                lagExceedStartTime = now; // 重置计时
+            }
+        } else if (lagBytes < lagThresholdLow) {
+            lagExceedStartTime = 0;
+            if (lagRecoverStartTime == 0) {
+                lagRecoverStartTime = now;
+            } else if (now - lagRecoverStartTime > 60_000 && multiplier > 1.0) {
+                multiplier = 1.0;
+                log.info("同步延迟已恢复正常，拉取批次大小已调回默认值");
+                lagRecoverStartTime = 0;
+            }
+        } else {
+            lagExceedStartTime = 0;
+            lagRecoverStartTime = 0;
+        }
+        
+        return (int)(baseBatchSize * multiplier);
+    }
+    
+    public double getMultiplier() { return multiplier; }
+}
+```
+
+#### 15.3.2 Topic 隔离机制
+
+```java
+/**
+ * Topic 隔离管理器 — 将连续写入失败的 Topic 临时隔离
+ * 避免异常 Topic 阻塞整体同步进度
+ */
+public class TopicIsolationManager {
+    /** 被隔离的 Topic 集合 → 隔离时间 */
+    private final ConcurrentHashMap<String, Long> isolatedTopics = new ConcurrentHashMap<>();
+    /** Topic 连续失败计数 */
+    private final ConcurrentHashMap<String, AtomicInteger> failCounts = new ConcurrentHashMap<>();
+    private final int maxFailCount;  // 来自 --sinkMaxRetry
+    private static final long RECOVERY_INTERVAL_MS = 60_000; // 60s 自动恢复探测
+    
+    /**
+     * 记录 Topic 写入失败
+     * 连续失败超过阈值 → 加入隔离列表
+     */
+    public void recordFailure(String topic) {
+        int count = failCounts.computeIfAbsent(topic, k -> new AtomicInteger(0))
+            .incrementAndGet();
+        
+        if (count >= maxFailCount && !isolatedTopics.containsKey(topic)) {
+            isolatedTopics.put(topic, System.currentTimeMillis());
+            log.warn("Topic [{}] 连续写入失败 {} 次，已加入隔离列表", topic, count);
+        }
+    }
+    
+    /**
+     * 记录 Topic 写入成功 → 重置失败计数
+     */
+    public void recordSuccess(String topic) {
+        failCounts.remove(topic);
+    }
+    
+    /**
+     * 检查 Topic 是否被隔离
+     */
+    public boolean isIsolated(String topic) {
+        return isolatedTopics.containsKey(topic);
+    }
+    
+    /**
+     * 定期执行隔离 Topic 恢复探测（每 60s）
+     * 尝试写入一条消息，成功则移除隔离
+     */
+    public void probeIsolatedTopics(Function<String, Boolean> probeFn) {
+        for (Map.Entry<String, Long> entry : isolatedTopics.entrySet()) {
+            String topic = entry.getKey();
+            if (System.currentTimeMillis() - entry.getValue() >= RECOVERY_INTERVAL_MS) {
+                if (probeFn.apply(topic)) {
+                    isolatedTopics.remove(topic);
+                    failCounts.remove(topic);
+                    log.info("Topic [{}] 隔离恢复成功，已移除隔离", topic);
+                }
+            }
+        }
+    }
+    
+    public int getIsolatedTopicCount() { return isolatedTopics.size(); }
+    public Set<String> getIsolatedTopicList() { return isolatedTopics.keySet(); }
+}
+```
+
+### 15.4 写入侧梯度重试与任务暂停设计
+
+> **对应需求**：需求 21 §21.3
+
+#### 15.4.1 梯度重试架构
+
+```
+写入失败 → 梯度退避重试（1s → 3s → 10s → 30s → 60s）
+                   │
+           某次成功 → 归零，继续正常同步
+                   │
+           全部失败 → 任务暂停（SUSPENDED）
+                        │
+                   停止拉取 + ERROR日志 + 监控告警
+                        │
+                   POST /resume → 手动恢复
+```
+
+#### 15.4.2 核心类设计
+
+```java
+/**
+ * 梯度退避重试管理器 — 写入失败时按梯度时间间隔重试
+ * 所有重试耗尽后暂停同步任务，等待人工恢复
+ */
+public class GradientRetryManager {
+    private final int maxRetry;                    // 最大重试次数（默认 5）
+    private final int[] retryDelays;               // 各级等待时间（秒），如 {1,3,10,30,60}
+    private final AtomicInteger currentRetryLevel = new AtomicInteger(0);
+    private volatile boolean suspended = false;
+    private volatile long suspendStartTime = 0;
+    private volatile String lastError = "";
+    
+    // 监控计数器
+    private final AtomicLong gradientRetryCount = new AtomicLong(0);
+    private final AtomicLong gradientRetryRecoverCount = new AtomicLong(0);
+    private final AtomicLong suspendCount = new AtomicLong(0);
+    
+    public GradientRetryManager(int maxRetry, int[] retryDelays) {
+        this.maxRetry = maxRetry;
+        this.retryDelays = retryDelays;
+    }
+    
+    /**
+     * 带梯度重试的写入操作
+     * @param writeFn 实际写入函数，返回 true=成功，false=失败
+     * @return true=最终写入成功，false=全部重试耗尽
+     */
+    public boolean executeWithGradientRetry(Supplier<Boolean> writeFn, String errorContext) {
+        // 首次尝试
+        if (writeFn.get()) {
+            resetRetry();
+            return true;
+        }
+        
+        // 进入梯度重试
+        for (int i = 0; i < maxRetry; i++) {
+            int delaySeconds = i < retryDelays.length ? retryDelays[i] : retryDelays[retryDelays.length - 1];
+            currentRetryLevel.set(i + 1);
+            gradientRetryCount.incrementAndGet();
+            
+            log.warn("目标集群写入失败，第 {} 次梯度重试，等待 {}s 后重试。错误：{}",
+                i + 1, delaySeconds, errorContext);
+            
+            try {
+                TimeUnit.SECONDS.sleep(delaySeconds);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+            
+            if (writeFn.get()) {
+                log.info("目标集群写入在第 {} 次重试后恢复成功", i + 1);
+                gradientRetryRecoverCount.incrementAndGet();
+                resetRetry();
+                return true;
+            }
+        }
+        
+        // 全部重试耗尽 → 暂停任务
+        suspend(errorContext);
+        return false;
+    }
+    
+    /**
+     * 暂停同步任务
+     */
+    private void suspend(String errorMsg) {
+        suspended = true;
+        suspendStartTime = System.currentTimeMillis();
+        lastError = errorMsg;
+        suspendCount.incrementAndGet();
+        
+        log.error("目标集群写入持续失败，梯度重试 {} 次全部耗尽，同步任务已暂停。" +
+            "最后错误：{}。请检查目标集群状态后通过 POST /resume 恢复",
+            maxRetry, errorMsg);
+    }
+    
+    /**
+     * 手动恢复任务（由 POST /resume 接口调用）
+     */
+    public void resume() {
+        suspended = false;
+        suspendStartTime = 0;
+        lastError = "";
+        resetRetry();
+        log.info("同步任务已手动恢复");
+    }
+    
+    /**
+     * 暂停状态周期性告警（每 30s 调用一次）
+     */
+    public void periodicSuspendAlert() {
+        if (suspended) {
+            long durationSec = (System.currentTimeMillis() - suspendStartTime) / 1000;
+            log.error("同步任务已暂停：原因={}，暂停时长={}秒，请通过 POST /resume 恢复",
+                lastError, durationSec);
+        }
+    }
+    
+    private void resetRetry() {
+        currentRetryLevel.set(0);
+    }
+    
+    // Getter methods for metrics
+    public boolean isSuspended() { return suspended; }
+    public long getSuspendCount() { return suspendCount.get(); }
+    public long getSuspendDurationSeconds() {
+        return suspended ? (System.currentTimeMillis() - suspendStartTime) / 1000 : 0;
+    }
+    public long getGradientRetryCount() { return gradientRetryCount.get(); }
+    public long getGradientRetryRecoverCount() { return gradientRetryRecoverCount.get(); }
+    public int getLastRetryLevel() { return currentRetryLevel.get(); }
+}
+```
+
+### 15.5 延迟消息同步设计
+
+> **对应需求**：需求 21 §21.4
+
+#### 15.5.1 延迟消息在 CommitLog 中的存储结构
+
+```
+源集群 Producer 发送延迟消息流程：
+  Producer.send(msg, delayTimeLevel=3)
+    → Broker 将消息写入 SCHEDULE_TOPIC_XXXX（queueId = delayTimeLevel - 1）
+    → 消息属性中保存原始 Topic (REAL_TOPIC) 和 QueueId (REAL_QID)
+    → 延迟到期后 → 写入真实 Topic（此时会产生新的 CommitLog 记录）
+
+同步组件处理策略：
+  CommitLog 解析到 SCHEDULE_TOPIC_XXXX
+    → 解析 REAL_TOPIC / REAL_QID / DELAY 属性
+    → 产出 SyncRecord (type=DELAY_MESSAGE, topic=原始Topic)
+    → Sink 写入目标集群时设置 delayTimeLevel
+```
+
+#### 15.5.2 核心类设计
+
+```java
+/**
+ * 延迟消息处理器 — 在 CommitLogParser 中识别和解析延迟消息
+ */
+public class DelayMessageHandler {
+    /** RocketMQ 延迟消息内部 Topic */
+    private static final String SCHEDULE_TOPIC = "SCHEDULE_TOPIC_XXXX";
+    
+    private final AtomicLong syncCount = new AtomicLong(0);
+    private final AtomicLong parseErrorCount = new AtomicLong(0);
+    private final AtomicLong skipCount = new AtomicLong(0);
+    
+    /**
+     * 判断是否为延迟消息
+     */
+    public boolean isDelayMessage(String topic) {
+        return SCHEDULE_TOPIC.equals(topic);
+    }
+    
+    /**
+     * 解析延迟消息，提取原始投递信息
+     * @return 解析后的 SyncRecord，失败返回 null（消息将发送到 RFQ）
+     */
+    public SyncRecord parseDelayMessage(DispatchRequest request, ByteBuffer bodyBuffer) {
+        Map<String, String> properties = request.getPropertiesMap();
+        
+        String realTopic = properties.get("REAL_TOPIC");
+        String realQidStr = properties.get("REAL_QID");
+        String delayStr = properties.get("DELAY");
+        
+        if (realTopic == null || realQidStr == null) {
+            parseErrorCount.incrementAndGet();
+            log.warn("延迟消息解析失败，缺少必要属性：offset={}", request.getCommitLogOffset());
+            return null; // 将发送到 RFQ
+        }
+        
+        int realQueueId = Integer.parseInt(realQidStr);
+        int delayTimeLevel = delayStr != null ? Integer.parseInt(delayStr) : 0;
+        
+        SyncRecord record = new SyncRecord();
+        record.setTopic(realTopic);               // 设置为原始 Topic
+        record.setQueueId(realQueueId);            // 设置为原始 QueueId
+        record.setSyncRecordType(SyncRecordType.DELAY_MESSAGE);
+        record.setDelayTimeLevel(delayTimeLevel);  // 保存延迟级别
+        record.setPhysicOffset(request.getCommitLogOffset());
+        record.setBody(bodyBuffer);
+        record.setProperties(properties);
+        
+        syncCount.incrementAndGet();
+        return record;
+    }
+    
+    public long getSyncCount() { return syncCount.get(); }
+    public long getParseErrorCount() { return parseErrorCount.get(); }
+    public long getSkipCount() { return skipCount.get(); }
+}
+
+/**
+ * Sink 端延迟消息写入 — 在目标集群以延迟消息形式投递
+ */
+// 在 RocketMQSink.writeToTarget() 中：
+// if (record.getSyncRecordType() == SyncRecordType.DELAY_MESSAGE) {
+//     message.setDelayTimeLevel(record.getDelayTimeLevel());
+// }
+```
+
+### 15.6 定时消息同步设计
+
+> **对应需求**：需求 21 §21.5
+
+#### 15.6.1 定时消息在 CommitLog 中的存储结构
+
+```
+RocketMQ 5.x TimerWheel 定时消息流程：
+  Producer.send(msg, deliverTimeMs=1679284800000)
+    → Broker 将消息属性设置 __STARTDELIVERTIME
+    → 消息写入 rmq_sys_wheel_timer（TimerWheel 系统 Topic）
+    → 定时到期后 → 写入真实 Topic
+
+RocketMQ 4.x 定时消息（通过属性传递）：
+  Producer.send(msg, properties={__STARTDELIVERTIME=timestamp})
+    → 消息写入原始 Topic（带定时属性）
+    → Broker 延迟投递
+
+同步组件处理策略：
+  1. 识别 rmq_sys_wheel_timer Topic → 解析原始 Topic/QueueId/投递时间
+  2. 识别消息属性中的 __STARTDELIVERTIME → 保留并传递给目标集群
+  3. 产出 SyncRecord (type=TIMER_MESSAGE)
+  4. Sink 写入时设置 __STARTDELIVERTIME 属性
+```
+
+#### 15.6.2 核心类设计
+
+```java
+/**
+ * 定时消息处理器 — 在 CommitLogParser 中识别和解析定时消息
+ */
+public class TimerMessageHandler {
+    /** RocketMQ 5.x TimerWheel 系统 Topic */
+    private static final String TIMER_TOPIC = "rmq_sys_wheel_timer";
+    /** 定时投递属性 key */
+    private static final String DELIVER_TIME_KEY = "__STARTDELIVERTIME";
+    
+    private final AtomicLong syncCount = new AtomicLong(0);
+    private final AtomicLong expiredCount = new AtomicLong(0);
+    private final AtomicLong parseErrorCount = new AtomicLong(0);
+    
+    /**
+     * 判断是否为定时消息（TimerWheel 系统 Topic）
+     */
+    public boolean isTimerTopicMessage(String topic) {
+        return TIMER_TOPIC.equals(topic);
+    }
+    
+    /**
+     * 判断是否为带定时属性的消息
+     */
+    public boolean hasTimerProperty(Map<String, String> properties) {
+        return properties != null && properties.containsKey(DELIVER_TIME_KEY);
+    }
+    
+    /**
+     * 解析 TimerWheel Topic 中的定时消息
+     */
+    public SyncRecord parseTimerTopicMessage(DispatchRequest request, ByteBuffer bodyBuffer) {
+        Map<String, String> properties = request.getPropertiesMap();
+        
+        String realTopic = properties.get("REAL_TOPIC");
+        String realQidStr = properties.get("REAL_QID");
+        String deliverTimeStr = properties.get(DELIVER_TIME_KEY);
+        
+        if (realTopic == null || realQidStr == null || deliverTimeStr == null) {
+            parseErrorCount.incrementAndGet();
+            log.warn("定时消息解析失败，缺少必要属性：offset={}", request.getCommitLogOffset());
+            return null; // 将发送到 RFQ
+        }
+        
+        long deliverTimeMs = Long.parseLong(deliverTimeStr);
+        int realQueueId = Integer.parseInt(realQidStr);
+        
+        SyncRecord record = new SyncRecord();
+        record.setTopic(realTopic);
+        record.setQueueId(realQueueId);
+        record.setSyncRecordType(SyncRecordType.TIMER_MESSAGE);
+        record.setDeliverTimeMs(deliverTimeMs);
+        record.setPhysicOffset(request.getCommitLogOffset());
+        record.setBody(bodyBuffer);
+        record.setProperties(properties);
+        
+        // 检查是否已过期
+        if (deliverTimeMs <= System.currentTimeMillis()) {
+            expiredCount.incrementAndGet();
+            log.debug("定时消息已过期，将立即投递：topic={}, originalDeliverTime={}",
+                realTopic, deliverTimeMs);
+        }
+        
+        syncCount.incrementAndGet();
+        return record;
+    }
+    
+    public long getSyncCount() { return syncCount.get(); }
+    public long getExpiredCount() { return expiredCount.get(); }
+    public long getParseErrorCount() { return parseErrorCount.get(); }
+}
+
+/**
+ * Sink 端定时消息写入 — 在目标集群以定时消息形式投递
+ */
+// 在 RocketMQSink.writeToTarget() 中：
+// if (record.getSyncRecordType() == SyncRecordType.TIMER_MESSAGE) {
+//     message.putUserProperty("__STARTDELIVERTIME", 
+//         String.valueOf(record.getDeliverTimeMs()));
+// }
+```
+
+### 15.7 ACL 权限预检设计
+
+> **对应需求**：需求 21 §21.6
+
+#### 15.7.1 预检流程
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                      ACL 权限预检流程                             │
+└──────────────────────────────────────────────────────────────────┘
+
+ Source 端预检（启动时执行，需求 21 §21.6 第 1 条）：
+   ① 查询源集群 ClusterInfo（GET_BROKER_CLUSTER_INFO）→ 验证 NameServer 读权限
+   ② 读取 Source 注册 KV（GET_KV_CONFIG）→ 验证 KV 读写权限
+   ③ 向 RFQ Topic 发送探测消息（Tag=ACL_PROBE）→ 验证 Producer 写权限
+
+ Sink 端预检（启动时执行，需求 21 §21.6 第 2 条）：
+   ① 查询目标集群 Topic 列表 → 验证 NameServer 读权限
+   ② 向探活 Topic 发送探测消息 → 验证 Producer 写权限
+   ③ 读取 Checkpoint KV（GET_KV_CONFIG）→ 验证 KV 读写权限
+
+ 预检结果处理：
+   全部通过 → INFO 日志，继续启动
+   任一失败 → ERROR 日志（含失败操作、错误码、修复建议），非零退出
+   --skipAclCheck=true → 跳过预检，WARN 日志
+```
+
+#### 15.7.2 核心类设计
+
+```java
+/**
+ * ACL 权限预检器 — 在启动时验证对源集群和目标集群的读写权限
+ */
+public class AclPreChecker {
+    
+    /**
+     * Source 端 ACL 预检
+     */
+    public void checkSourcePermissions(SourceConfig config) {
+        List<String> results = new ArrayList<>();
+        
+        // 1. 源集群 NameServer 读权限
+        try {
+            mqClientAPI.getBrokerClusterInfo(config.getSourceNamesrv(), 3000);
+            results.add("✓ 源集群 NameServer 读权限");
+        } catch (Exception e) {
+            throw new AclCheckFailedException(
+                "源集群 NameServer 读权限检查失败: " + e.getMessage()
+                + "\n建议: 检查 --sourceNamesrv 地址是否正确，ACL 是否允许 GET_BROKER_CLUSTER_INFO");
+        }
+        
+        // 2. 源集群 KV 读写权限
+        try {
+            mqClientAPI.getKVConfig("SYNC_SOURCE_CONFIG", "acl_probe_test");
+            results.add("✓ 源集群 KV 读写权限");
+        } catch (Exception e) {
+            throw new AclCheckFailedException(
+                "源集群 KV 读写权限检查失败: " + e.getMessage()
+                + "\n建议: 检查 ACL 是否允许 GET_KV_CONFIG / PUT_KV_CONFIG");
+        }
+        
+        // 3. 源集群 Producer 写权限（RFQ Topic）
+        try {
+            Message probeMsg = new Message(config.getRfqTopic(), "ACL_PROBE", 
+                "probe".getBytes());
+            producer.send(probeMsg);
+            results.add("✓ 源集群 Producer 写权限");
+        } catch (Exception e) {
+            throw new AclCheckFailedException(
+                "源集群 RFQ Topic 写权限检查失败: " + e.getMessage()
+                + "\n建议: 检查 ACL 是否允许向 Topic [" + config.getRfqTopic() + "] 写入消息");
+        }
+        
+        log.info("权限预检通过: {}", String.join(", ", results));
+    }
+    
+    /**
+     * Sink 端 ACL 预检（类似逻辑）
+     */
+    public void checkSinkPermissions(SinkConfig config) {
+        // ... 目标集群 NameServer 读权限、Producer 写权限、KV 读写权限
+    }
+}
+```
+
+### 15.8 资源保护与背压机制设计
+
+> **对应需求**：需求 21 §21.7
+
+#### 15.8.1 背压机制架构
+
+```
+Source 拉取速率  ──►  内存缓冲区  ──►  Sink 写入速率
+                      │
+                      ├─ < 80% 水位：正常拉取
+                      ├─ ≥ 80% 水位：WARN 日志（需求 19 §8）
+                      └─ = 100% 满：阻塞 Source poll()，直到 < 80%
+                      
+令牌桶限流：
+  Source: --sourceMaxTps → 限制 poll() 频率
+  Sink:   --sinkMaxTps   → 限制 write() 频率
+```
+
+#### 15.8.2 令牌桶限流器
+
+```java
+/**
+ * 基于令牌桶的限流器（Token Bucket）
+ * 适用于 Source 拉取限流和 Sink 写入限流
+ */
+public class TokenBucketRateLimiter {
+    private final long maxTps;                    // 每秒最大令牌数（0=不限制）
+    private final AtomicLong availableTokens;     // 当前可用令牌数
+    private volatile long lastRefillTime;         // 上次填充时间
+    private final MetricsCollector metricsCollector;
+    private volatile boolean throttled = false;
+    private final AtomicLong throttledDurationMs = new AtomicLong(0);
+    
+    /**
+     * 尝试获取令牌（阻塞式）
+     * 当令牌不足时阻塞等待，直到有可用令牌
+     */
+    public void acquire() {
+        if (maxTps <= 0) return; // 不限制
+        
+        refillTokens();
+        
+        while (availableTokens.get() <= 0) {
+            throttled = true;
+            long waitStart = System.nanoTime();
+            LockSupport.parkNanos(1_000_000); // 等待 1ms
+            throttledDurationMs.addAndGet(
+                (System.nanoTime() - waitStart) / 1_000_000);
+            refillTokens();
+        }
+        
+        throttled = false;
+        availableTokens.decrementAndGet();
+    }
+    
+    /**
+     * 按时间补充令牌
+     */
+    private void refillTokens() {
+        long now = System.currentTimeMillis();
+        long elapsed = now - lastRefillTime;
+        if (elapsed >= 1) {
+            long newTokens = maxTps * elapsed / 1000;
+            availableTokens.set(Math.min(availableTokens.get() + newTokens, maxTps));
+            lastRefillTime = now;
+        }
+    }
+    
+    public boolean isThrottled() { return throttled; }
+    public long getThrottledDurationSeconds() { 
+        return throttledDurationMs.get() / 1000; 
+    }
+}
+```
+
+#### 15.8.3 JVM 资源监控
+
+```java
+/**
+ * JVM 资源指标采集
+ * 集成到 MetricsCollector，通过 /metrics 接口暴露
+ */
+public class JvmResourceMonitor {
+    
+    public Map<String, Object> getJvmMetrics() {
+        MemoryMXBean memoryBean = ManagementFactory.getMemoryMXBean();
+        MemoryUsage heapUsage = memoryBean.getHeapMemoryUsage();
+        
+        Map<String, Object> metrics = new LinkedHashMap<>();
+        metrics.put("jvmHeapUsedMB", heapUsage.getUsed() / 1024 / 1024);
+        metrics.put("jvmHeapMaxMB", heapUsage.getMax() / 1024 / 1024);
+        
+        // GC 暂停时间
+        long gcPauseMs = getLastGcPauseMs();
+        metrics.put("jvmGcPauseMs", gcPauseMs);
+        
+        // CPU 使用率
+        OperatingSystemMXBean osBean = ManagementFactory.getOperatingSystemMXBean();
+        if (osBean instanceof com.sun.management.OperatingSystemMXBean) {
+            double cpuUsage = ((com.sun.management.OperatingSystemMXBean) osBean)
+                .getProcessCpuLoad() * 100;
+            metrics.put("processCpuUsagePercent", Math.round(cpuUsage * 10) / 10.0);
+        }
+        
+        return metrics;
+    }
+    
+    /**
+     * 堆内存使用率告警（>85%）
+     */
+    public void checkHeapUsage() {
+        MemoryUsage heapUsage = ManagementFactory.getMemoryMXBean()
+            .getHeapMemoryUsage();
+        double usagePercent = (double) heapUsage.getUsed() / heapUsage.getMax() * 100;
+        
+        if (usagePercent > 85) {
+            log.warn("JVM 堆内存使用率过高: {:.1f}%，建议增大 -Xmx 或减少缓冲区大小",
+                usagePercent);
+        }
+    }
+}
+```
+
+### 15.9 事务消息过滤设计
+
+> **对应需求**：需求 21 §21.8
+
+#### 15.9.1 事务消息识别与跳过
+
+```java
+/**
+ * 事务消息过滤器 — 同步组件不支持事务消息同步
+ * 识别到事务 Half/Op 消息后直接跳过，已提交的事务消息（写入真实 Topic）正常同步
+ */
+public class TransactionMessageFilter {
+    /** RocketMQ 事务 Half 消息 Topic */
+    private static final String TRANS_HALF_TOPIC = "RMQ_SYS_TRANS_HALF_TOPIC";
+    /** RocketMQ 事务 Op 消息 Topic */
+    private static final String TRANS_OP_TOPIC = "RMQ_SYS_TRANS_OP_HALF_TOPIC";
+    
+    private final AtomicLong skipCount = new AtomicLong(0);
+    
+    /**
+     * 判断消息是否需要跳过（事务消息一律跳过）
+     * @return true=跳过（事务中间状态消息），false=正常同步
+     */
+    public boolean shouldSkip(String topic) {
+        if (TRANS_HALF_TOPIC.equals(topic) || TRANS_OP_TOPIC.equals(topic)) {
+            skipCount.incrementAndGet();
+            log.debug("跳过事务消息：topic={}", topic);
+            return true;
+        }
+        return false;
+    }
+    
+    public long getSkipCount() { return skipCount.get(); }
+}
+
+/*
+ * 设计决策说明：
+ * 
+ * 事务消息依赖源集群本地事务状态机（事务回查机制），
+ * 其状态与源集群的 Broker 紧耦合，无法在目标集群还原。
+ * 
+ * 处理策略（不可配置，始终跳过）：
+ * - SCHEDULE_TOPIC_XXXX 之外的 RMQ_SYS_TRANS_HALF_TOPIC → 跳过
+ * - RMQ_SYS_TRANS_OP_HALF_TOPIC → 跳过
+ * - 已提交的事务消息（写入真实 Topic 的消息）→ 正常同步（作为普通消息）
+ * 
+ * 业务方如需跨集群事务一致性：
+ * 应在应用层完成事务后再投递普通消息用于同步。
+ */
+```
+
+### 15.10 Prometheus 指标导出设计
+
+> **对应需求**：需求 21 §21.9
+
+#### 15.10.1 接口设计
+
+```
+GET /metrics/prometheus
+Content-Type: text/plain; version=0.0.4; charset=utf-8
+
+# HELP ha_sync_connection_status Current connection status (1=CONNECTED, 2=RECONNECTING, 3=DISCONNECTED, 4=SUSPENDED)
+# TYPE ha_sync_connection_status gauge
+ha_sync_connection_status{role="source",node_id="source-node-01"} 1
+
+# HELP ha_sync_sync_success_count_total Total messages successfully written to target cluster
+# TYPE ha_sync_sync_success_count_total counter
+ha_sync_sync_success_count_total{role="sink",node_id="sink-01"} 123456
+
+# HELP ha_sync_lag_bytes Current sync lag in bytes
+# TYPE ha_sync_lag_bytes gauge
+ha_sync_lag_bytes{role="source",node_id="source-node-01"} 100000
+
+# HELP ha_sync_current_tps Current messages per second
+# TYPE ha_sync_current_tps gauge
+ha_sync_current_tps{role="source",node_id="source-node-01"} 5000
+
+# HELP ha_sync_jvm_heap_used_bytes JVM heap memory used in bytes
+# TYPE ha_sync_jvm_heap_used_bytes gauge
+ha_sync_jvm_heap_used_bytes{role="source",node_id="source-node-01"} 536870912
+...
+```
+
+#### 15.10.2 核心类设计
+
+```java
+/**
+ * Prometheus 格式指标导出器
+ * 将 MetricsCollector 中的指标转换为 Prometheus exposition format
+ */
+public class PrometheusExporter {
+    private final MetricsCollector metricsCollector;
+    private final String role;     // "source" 或 "sink"
+    private final String nodeId;   // sourceNodeId 或 sinkId
+    
+    /** Counter 类型指标（后缀添加 _total） */
+    private static final Set<String> COUNTER_METRICS = Set.of(
+        "connectionErrorCount", "retryCount", "nameSrvQueryErrorCount",
+        "parseErrorCount", "halfPacketDropCount", "offsetMismatchCount",
+        "masterSwitchCount", "parseErrorSuspendCount",
+        "syncSuccessCount", "syncFailureCount", "filteredMessageCount",
+        "storageWriteErrorCount", "checkpointFlushErrorCount",
+        "rfqSendSuccessCount", "rfqSendFailureCount", "rfqFallbackCount",
+        "topicSyncOnDemandCount", "topicSyncFailureCount",
+        "metaSyncSuccessCount", "metaSyncErrorCount",
+        "brokerFailoverCount", "nameSrvSwitchCount",
+        "clusterTopologyChangeCount",
+        "sinkSuspendCount", "sinkGradientRetryCount", "sinkGradientRetryRecoverCount",
+        "delayMsgSyncCount", "delayMsgParseErrorCount", "delayMsgSkipCount",
+        "timerMsgSyncCount", "timerMsgExpiredCount", "timerMsgParseErrorCount",
+        "transactionMsgSkipCount"
+    );
+    
+    /**
+     * 生成 Prometheus 格式的指标文本
+     */
+    public String export() {
+        StringBuilder sb = new StringBuilder();
+        Map<String, Object> allMetrics = metricsCollector.getAllMetrics();
+        
+        for (Map.Entry<String, Object> entry : allMetrics.entrySet()) {
+            String metricName = toPrometheusName(entry.getKey());
+            Object value = entry.getValue();
+            
+            if (value instanceof Number) {
+                String type = COUNTER_METRICS.contains(entry.getKey()) 
+                    ? "counter" : "gauge";
+                String suffix = type.equals("counter") ? "_total" : "";
+                
+                sb.append("# HELP ").append(metricName).append(suffix)
+                    .append(" ").append(getHelpText(entry.getKey())).append("\n");
+                sb.append("# TYPE ").append(metricName).append(suffix)
+                    .append(" ").append(type).append("\n");
+                sb.append(metricName).append(suffix)
+                    .append("{role=\"").append(role)
+                    .append("\",node_id=\"").append(nodeId).append("\"} ")
+                    .append(value).append("\n");
+            }
+        }
+        return sb.toString();
+    }
+    
+    /**
+     * 指标名称转换：camelCase → ha_sync_snake_case
+     */
+    private String toPrometheusName(String name) {
+        return "ha_sync_" + name.replaceAll("([A-Z])", "_$1").toLowerCase();
+    }
+}
+```
+
+### 15.11 增强后的异常处理全景图
+
+```mermaid
+graph TD
+    subgraph "连接层异常（已有+增强）"
+        A1[Master 宕机] -->|"需求 14 §1-3"| R1[重连 + 指数退避]
+        A2[网络闪断] -->|"需求 14 §4-6"| R2[从 Checkpoint 重连]
+        A3[半包数据] -->|"需求 14 §6"| R3[丢弃 + 重连]
+        A4[部分网络分区] -->|"需求 21 §21.1"| R4[NameServer切换 + Broker故障转移]
+    end
+
+    subgraph "解析层异常（已有+增强）"
+        B1[magicCode 不匹配] -->|"需求 14 §7"| R5[RFQ + 跳过继续]
+        B2[totalSize 异常] -->|"需求 14 §7"| R5
+        B3[CRC 校验失败] -->|"需求 14 §7"| R5
+        B4[解析失败频繁] -->|"需求 14 §12"| R6[暂停 Source]
+        B5[事务 Half 消息] -->|"需求 21 §21.8"| R7[直接跳过，不同步]
+        B6[延迟消息] -->|"需求 21 §21.4"| R14[解析原始Topic+延迟级别]
+        B7[定时消息] -->|"需求 21 §21.5"| R15[解析原始Topic+投递时间]
+    end
+
+    subgraph "写入层异常（已有+增强）"
+        C1[目标集群写入失败] -->|"需求 15 §1"| R8[指数退避重试]
+        C2[重试均失败] -->|"需求 15 §3"| R9[RFQ]
+        C3[连续失败>10次] -->|"需求 16 §1"| R10[标记 UNAVAILABLE + 探活]
+        C4[梯度重试全耗尽] -->|"需求 21 §21.3"| R11[任务暂停SUSPENDED+告警]
+        C6[Topic 维度失败] -->|"需求 21 §21.2"| R13[Topic 隔离]
+    end
+
+    subgraph "配置层异常（新增）"
+        D1[ACL 权限不足] -->|"需求 21 §21.6"| R16[启动预检+明确报错]
+    end
+
+    subgraph "资源层异常（新增）"
+        E1[缓冲区溢出] -->|"需求 21 §21.7"| R17[背压阻塞 Source]
+        E2[TPS 过高] -->|"需求 21 §21.7"| R18[令牌桶限流]
+        E3[JVM 内存过高] -->|"需求 21 §21.7"| R19[WARN 日志 + 建议]
+    end
+
+    subgraph "恢复机制"
+        R6 -->|"POST /resume"| REC1[人工恢复]
+        R10 -->|"探活成功"| REC2[自动恢复]
+        R11 -->|"POST /resume"| REC3[人工恢复]
+        R13 -->|"60s 探测"| REC4[自动恢复隔离 Topic]
+    end
+```
+
+### 15.12 新增配置参数汇总
+
+#### Source 新增参数
+
+| 参数 | 环境变量 | 默认值 | 说明 | 对应需求 |
+|------|---------|--------|------|---------|
+| `--sourceBufferCapacity <n>` | `HA_SOURCE_SOURCE_BUFFER_CAPACITY` | `10000` | 内存缓冲区最大 SyncRecord 条数 | §21.7 |
+| `--sourceMaxTps <n>` | `HA_SOURCE_SOURCE_MAX_TPS` | `0` | 每秒最大拉取消息条数（0=不限制） | §21.7 |
+| `--skipAclCheck` | `HA_SOURCE_SKIP_ACL_CHECK` | `false` | 是否跳过 ACL 权限预检 | §21.6 |
+| `--aclAccessKey <key>` | `HA_SOURCE_ACL_ACCESS_KEY` | （空） | ACL 访问密钥 | §21.6 |
+| `--aclSecretKey <key>` | `HA_SOURCE_ACL_SECRET_KEY` | （空） | ACL 密钥 | §21.6 |
+| `--prometheusEnabled` | `HA_SOURCE_PROMETHEUS_ENABLED` | `true` | 是否启用 Prometheus 接口 | §21.9 |
+
+#### Sink 新增参数
+
+| 参数 | 环境变量 | 默认值 | 说明 | 对应需求 |
+|------|---------|--------|------|---------|
+| `--sinkGradientMaxRetry <n>` | `HA_SINK_SINK_GRADIENT_MAX_RETRY` | `5` | 梯度重试最大次数 | §21.3 |
+| `--sinkGradientRetryDelays <delays>` | `HA_SINK_SINK_GRADIENT_RETRY_DELAYS` | `1,3,10,30,60` | 各级重试等待时间（秒，逗号分隔） | §21.3 |
+| `--sinkMaxTps <n>` | `HA_SINK_SINK_MAX_TPS` | `0` | 每秒最大写入消息条数（0=不限制） | §21.7 |
+| `--skipAclCheck` | `HA_SINK_SKIP_ACL_CHECK` | `false` | 是否跳过 ACL 权限预检 | §21.6 |
+| `--aclAccessKey <key>` | `HA_SINK_ACL_ACCESS_KEY` | （空） | ACL 访问密钥 | §21.6 |
+| `--aclSecretKey <key>` | `HA_SINK_ACL_SECRET_KEY` | （空） | ACL 密钥 | §21.6 |
+| `--prometheusEnabled` | `HA_SINK_PROMETHEUS_ENABLED` | `true` | 是否启用 Prometheus 接口 | §21.9 |
+
+---
+
 ## 附录
 
 ### A. 需求文档追踪矩阵
@@ -3617,6 +4677,7 @@ CMD ["--configFile=/app/ha-sync-source.properties"]
 | 需求 18 | Source 多实例注册与 Sink 分布式消费 | 第 11.3 章（含 11.3.1~11.3.4 详细设计） |
 | 需求 19 | 全链路 Trace 监控 | 第 8.6 章（含 8.6.1~8.6.5 TraceCollector 详细设计）、9 章 |
 | 需求 20 | 监控指标采集 | 第 8 章（含 8.8.3 滑动窗口指标计算实现） |
+| 需求 21 | 故障场景增强 | 第 15 章 |
 
 ### B. 参考文档
 
@@ -3643,7 +4704,7 @@ CMD ["--configFile=/app/ha-sync-source.properties"]
 
 ---
 
-**文档版本**：v2.0  
-**最后更新**：2026-03-17  
+**文档版本**：v3.0  
+**最后更新**：2026-03-19  
 **作者**：HA Sync Team  
 **关联需求文档**：[requirements.md](./requirements.md)

@@ -58,6 +58,20 @@ public class MetricsCollectorTest {
         assertEquals(0L, collector.getTopicSyncFailureCount());
         assertFalse(collector.isTopicSyncSuspended());
         assertEquals("", collector.getTopicSyncFailedTopic());
+        // 需求 21 新增指标初始值
+        assertFalse(collector.isSinkSuspended());
+        assertEquals(0L, collector.getSinkSuspendCount());
+        assertEquals(0L, collector.getSinkSuspendDurationSeconds());
+        assertEquals(0L, collector.getSinkGradientRetryCount());
+        assertEquals(0L, collector.getSinkGradientRetryRecoverCount());
+        assertEquals(0, collector.getSinkLastRetryLevel());
+        assertEquals(0L, collector.getDelayMsgSyncCount());
+        assertEquals(0L, collector.getDelayMsgParseErrorCount());
+        assertEquals(0L, collector.getDelayMsgSkipCount());
+        assertEquals(0L, collector.getTimerMsgSyncCount());
+        assertEquals(0L, collector.getTimerMsgExpiredCount());
+        assertEquals(0L, collector.getTimerMsgParseErrorCount());
+        assertEquals(0L, collector.getTransactionMsgSkipCount());
     }
 
     @Test
@@ -155,6 +169,70 @@ public class MetricsCollectorTest {
         assertEquals(1L, collector.getTopicSyncFailureCount());
     }
 
+    // ==================== 需求 21 新增指标 increment ====================
+
+    @Test
+    public void testRequirement21Increments() {
+        collector.incrementSinkSuspendCount();
+        assertEquals(1L, collector.getSinkSuspendCount());
+
+        collector.incrementSinkGradientRetryCount();
+        collector.incrementSinkGradientRetryCount();
+        assertEquals(2L, collector.getSinkGradientRetryCount());
+
+        collector.incrementSinkGradientRetryRecoverCount();
+        assertEquals(1L, collector.getSinkGradientRetryRecoverCount());
+
+        collector.incrementDelayMsgSyncCount();
+        assertEquals(1L, collector.getDelayMsgSyncCount());
+
+        collector.incrementDelayMsgParseErrorCount();
+        assertEquals(1L, collector.getDelayMsgParseErrorCount());
+
+        collector.incrementDelayMsgSkipCount();
+        assertEquals(1L, collector.getDelayMsgSkipCount());
+
+        collector.incrementTimerMsgSyncCount();
+        assertEquals(1L, collector.getTimerMsgSyncCount());
+
+        collector.incrementTimerMsgExpiredCount();
+        assertEquals(1L, collector.getTimerMsgExpiredCount());
+
+        collector.incrementTimerMsgParseErrorCount();
+        assertEquals(1L, collector.getTimerMsgParseErrorCount());
+
+        collector.incrementTransactionMsgSkipCount();
+        assertEquals(1L, collector.getTransactionMsgSkipCount());
+    }
+
+    @Test
+    public void testRequirement21Setters() {
+        collector.setSinkSuspended(true);
+        assertTrue(collector.isSinkSuspended());
+
+        collector.setSinkSuspendDurationSeconds(120);
+        assertEquals(120L, collector.getSinkSuspendDurationSeconds());
+
+        collector.setSinkLastRetryLevel(3);
+        assertEquals(3, collector.getSinkLastRetryLevel());
+    }
+
+    @Test
+    public void testGetSinkMetrics_ContainsRequirement21Fields() {
+        collector.setSinkSuspended(true);
+        collector.incrementSinkSuspendCount();
+        collector.incrementDelayMsgSyncCount();
+        collector.incrementTimerMsgSyncCount();
+        collector.incrementTransactionMsgSkipCount();
+
+        Map<String, Object> sink = collector.getSinkMetrics();
+        assertTrue((Boolean) sink.get("sinkSuspended"));
+        assertEquals(1L, sink.get("sinkSuspendCount"));
+        assertEquals(1L, sink.get("delayMsgSyncCount"));
+        assertEquals(1L, sink.get("timerMsgSyncCount"));
+        assertEquals(1L, sink.get("transactionMsgSkipCount"));
+    }
+
     // ==================== Pipeline 侧 increment ====================
 
     @Test
@@ -208,6 +286,20 @@ public class MetricsCollectorTest {
         collector.setTopicSyncSuspended(false, "");
         assertFalse(collector.isTopicSyncSuspended());
         assertEquals("", collector.getTopicSyncFailedTopic());
+        // 需求 21 新增指标初始值
+        assertFalse(collector.isSinkSuspended());
+        assertEquals(0L, collector.getSinkSuspendCount());
+        assertEquals(0L, collector.getSinkSuspendDurationSeconds());
+        assertEquals(0L, collector.getSinkGradientRetryCount());
+        assertEquals(0L, collector.getSinkGradientRetryRecoverCount());
+        assertEquals(0, collector.getSinkLastRetryLevel());
+        assertEquals(0L, collector.getDelayMsgSyncCount());
+        assertEquals(0L, collector.getDelayMsgParseErrorCount());
+        assertEquals(0L, collector.getDelayMsgSkipCount());
+        assertEquals(0L, collector.getTimerMsgSyncCount());
+        assertEquals(0L, collector.getTimerMsgExpiredCount());
+        assertEquals(0L, collector.getTimerMsgParseErrorCount());
+        assertEquals(0L, collector.getTransactionMsgSkipCount());
     }
 
     @Test
@@ -265,7 +357,7 @@ public class MetricsCollectorTest {
         collector.setTargetClusterStatus("UNAVAILABLE");
 
         Map<String, Object> sink = collector.getSinkMetrics();
-        assertEquals(19, sink.size());
+        assertEquals(32, sink.size());
         assertEquals(2L, sink.get("syncSuccessCount"));
         assertEquals("UNAVAILABLE", sink.get("targetClusterStatus"));
     }
@@ -327,6 +419,20 @@ public class MetricsCollectorTest {
         assertEquals("AVAILABLE", collector.getTargetClusterStatus());
         assertFalse(collector.isTopicSyncSuspended());
         assertEquals("", collector.getTopicSyncFailedTopic());
+        // 需求 21 新增指标初始值
+        assertFalse(collector.isSinkSuspended());
+        assertEquals(0L, collector.getSinkSuspendCount());
+        assertEquals(0L, collector.getSinkSuspendDurationSeconds());
+        assertEquals(0L, collector.getSinkGradientRetryCount());
+        assertEquals(0L, collector.getSinkGradientRetryRecoverCount());
+        assertEquals(0, collector.getSinkLastRetryLevel());
+        assertEquals(0L, collector.getDelayMsgSyncCount());
+        assertEquals(0L, collector.getDelayMsgParseErrorCount());
+        assertEquals(0L, collector.getDelayMsgSkipCount());
+        assertEquals(0L, collector.getTimerMsgSyncCount());
+        assertEquals(0L, collector.getTimerMsgExpiredCount());
+        assertEquals(0L, collector.getTimerMsgParseErrorCount());
+        assertEquals(0L, collector.getTransactionMsgSkipCount());
     }
 
     // ==================== 线程安全 ====================

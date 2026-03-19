@@ -6,6 +6,7 @@ import org.apache.rocketmq.hasync.config.SinkConfig;
 import org.apache.rocketmq.hasync.core.SyncSink;
 import org.apache.rocketmq.hasync.metrics.MetricsCollector;
 import org.apache.rocketmq.hasync.model.SyncRecord;
+import org.apache.rocketmq.hasync.model.SyncRecordType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -27,6 +28,8 @@ import java.util.concurrent.atomic.AtomicLong;
  *   <li>需求 12 §9-17：Topic 按需同步</li>
  *   <li>需求 15：自动重试</li>
  *   <li>需求 16：目标不可写处理</li>
+ *   <li>需求 21 §21.3：梯度重试与任务暂停</li>
+ *   <li>需求 21 §21.4/§21.5：延迟消息/定时消息写入</li>
  * </ul>
  */
 public class RocketMQSink implements SyncSink {
@@ -35,6 +38,12 @@ public class RocketMQSink implements SyncSink {
 
     /** 连续写入失败阈值 → 标记目标集群不可写 */
     private static final int CONTINUOUS_FAIL_THRESHOLD = 10;
+
+    /** __STARTDELIVERTIME 属性 key（定时消息） */
+    private static final String DELIVER_TIME_KEY = "__STARTDELIVERTIME";
+
+    /** DELAY 属性 key（延迟消息） */
+    private static final String DELAY_LEVEL_KEY = "DELAY";
 
     private final SinkConfig config;
     private final TopicFilter topicFilter;
@@ -49,6 +58,9 @@ public class RocketMQSink implements SyncSink {
     private final AtomicLong targetUnavailableStartTime = new AtomicLong(0);
     private volatile String targetClusterStatus = "AVAILABLE";
     private volatile String syncStatus = "RUNNING";
+
+    /** 梯度重试管理器（需求 21 §21.3） */
+    private GradientRetryManager gradientRetryManager;
 
     /** 写入回调（抽象实际的 RocketMQ Producer 调用） */
     private SinkWriteCallback writeCallback;
@@ -92,6 +104,9 @@ public class RocketMQSink implements SyncSink {
         this.checkpointCoordinator = checkpointCoordinator;
         this.metricsCollector = metricsCollector;
 
+        // 初始化梯度重试管理器（需求 21 §21.3）
+        this.gradientRetryManager = new GradientRetryManager();
+
         // 将当前生效的 Topic 过滤白名单写入监控指标（需求 20 §5）
         if (metricsCollector != null && topicFilter != null) {
             String filterStr = topicFilter.isEnabled()
@@ -110,6 +125,14 @@ public class RocketMQSink implements SyncSink {
             }
             return writeCallback.send(topic, body, queueId, properties);
         });
+    }
+
+    public void setGradientRetryManager(GradientRetryManager manager) {
+        this.gradientRetryManager = manager;
+    }
+
+    public GradientRetryManager getGradientRetryManager() {
+        return gradientRetryManager;
     }
 
     @Override
@@ -155,6 +178,12 @@ public class RocketMQSink implements SyncSink {
             return;
         }
 
+        // 0. 检查是否处于暂停状态（需求 21 §21.3）
+        if (gradientRetryManager != null && gradientRetryManager.isSuspended()) {
+            log.debug("Sink 处于暂停状态，忽略写入：topic={}", record.getTopic());
+            return;
+        }
+
         // 1. Topic 过滤（需求 11）
         if (!topicFilter.accept(record.getTopic())) {
             // 被过滤的消息仍推进 confirmedOffset
@@ -186,6 +215,18 @@ public class RocketMQSink implements SyncSink {
             properties.putAll(record.getProperties());
         }
 
+        // 4.1 延迟消息属性设置（需求 21 §21.4）
+        if (record.getSyncRecordType() == SyncRecordType.DELAY_MESSAGE
+                && record.getDelayTimeLevel() > 0) {
+            properties.put(DELAY_LEVEL_KEY, String.valueOf(record.getDelayTimeLevel()));
+        }
+
+        // 4.2 定时消息属性设置（需求 21 §21.5）
+        if (record.getSyncRecordType() == SyncRecordType.TIMER_MESSAGE
+                && record.getDeliverTimeMs() > 0) {
+            properties.put(DELIVER_TIME_KEY, String.valueOf(record.getDeliverTimeMs()));
+        }
+
         // 5. 带重试写入（需求 15 + 需求 2 §6f）
         try {
             String msgId = retryPolicy.sendWithRetry(
@@ -201,8 +242,9 @@ public class RocketMQSink implements SyncSink {
             checkpointCoordinator.commitOffset(config.getSinkId(), record.getEndOffset());
 
             if (log.isDebugEnabled()) {
-                log.debug("消息写入成功: topic={}, physicOffset={}, msgId={}",
-                        record.getTopic(), record.getPhysicOffset(), msgId);
+                log.debug("消息写入成功: topic={}, physicOffset={}, msgId={}, type={}",
+                        record.getTopic(), record.getPhysicOffset(), msgId,
+                        record.getSyncRecordType());
             }
 
         } catch (SinkRetryPolicy.NonRetryableException e) {
@@ -233,10 +275,47 @@ public class RocketMQSink implements SyncSink {
             }
             metricsCollector.setTargetClusterStatus("UNAVAILABLE");
             log.error("连续写入失败 {} 次，标记目标集群为 UNAVAILABLE", failCount);
+
+            // 触发梯度重试（需求 21 §21.3）
+            if (gradientRetryManager != null) {
+                String errorContext = String.format("topic=%s, offset=%d, error=%s",
+                        record.getTopic(), record.getPhysicOffset(), e.getMessage());
+                boolean recovered = gradientRetryManager.executeWithGradientRetry(
+                        () -> probeTargetCluster(), errorContext);
+                if (recovered) {
+                    // 梯度重试中探活成功 → 恢复
+                    targetClusterStatus = "AVAILABLE";
+                    continuousFailCount.set(0);
+                    targetUnavailableStartTime.set(0);
+                    metricsCollector.setTargetClusterStatus("AVAILABLE");
+                    syncStatus = "RUNNING";
+                } else {
+                    // 梯度重试全部耗尽 → 任务暂停
+                    syncStatus = "SUSPENDED";
+                    metricsCollector.setSinkSuspended(true);
+                    metricsCollector.incrementSinkSuspendCount();
+                }
+            }
         }
 
         log.warn("消息写入失败: topic={}, physicOffset={}, error={}",
                 record.getTopic(), record.getPhysicOffset(), e.getMessage());
+    }
+
+    /**
+     * 恢复暂停的 Sink（需求 21 §21.3 — 由 POST /resume 调用）
+     */
+    public void resumeFromSuspend() {
+        if (gradientRetryManager != null && gradientRetryManager.isSuspended()) {
+            gradientRetryManager.resume();
+            syncStatus = "RUNNING";
+            targetClusterStatus = "AVAILABLE";
+            continuousFailCount.set(0);
+            targetUnavailableStartTime.set(0);
+            metricsCollector.setTargetClusterStatus("AVAILABLE");
+            metricsCollector.setSinkSuspended(false);
+            log.info("Sink 已从暂停状态恢复");
+        }
     }
 
     /**

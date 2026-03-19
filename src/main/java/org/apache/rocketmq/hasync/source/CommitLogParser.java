@@ -1,6 +1,7 @@
 package org.apache.rocketmq.hasync.source;
 
 import org.apache.rocketmq.hasync.model.SyncRecord;
+import org.apache.rocketmq.hasync.model.SyncRecordType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -24,6 +25,13 @@ import java.util.zip.CRC32;
  *   <li>totalSize 校验：> 20B 且 ≤ 4MB</li>
  *   <li>实际读取长度校验：实际字节数 == totalSize</li>
  *   <li>bodyCRC 校验：CRC32 比对</li>
+ * </ul>
+ * <p>
+ * 特殊消息处理（需求 21）：
+ * <ul>
+ *   <li>事务消息（§21.8）：Half/Op 消息直接跳过</li>
+ *   <li>延迟消息（§21.4）：SCHEDULE_TOPIC_XXXX 消息还原为原始 Topic + 延迟级别</li>
+ *   <li>定时消息（§21.5）：rmq_sys_wheel_timer 消息还原为原始 Topic + 投递时间</li>
  * </ul>
  *
  * @see org.apache.rocketmq.store.CommitLog
@@ -53,6 +61,15 @@ public class CommitLogParser {
     /** 解析失败回调（用于 RFQ） */
     private ParseFailureCallback failureCallback;
 
+    /** 事务消息过滤器（需求 21 §21.8） */
+    private TransactionMessageFilter transactionMessageFilter;
+
+    /** 延迟消息处理器（需求 21 §21.4） */
+    private DelayMessageHandler delayMessageHandler;
+
+    /** 定时消息处理器（需求 21 §21.5） */
+    private TimerMessageHandler timerMessageHandler;
+
     /**
      * 解析失败回调接口
      */
@@ -78,6 +95,18 @@ public class CommitLogParser {
 
     public void setFailureCallback(ParseFailureCallback failureCallback) {
         this.failureCallback = failureCallback;
+    }
+
+    public void setTransactionMessageFilter(TransactionMessageFilter filter) {
+        this.transactionMessageFilter = filter;
+    }
+
+    public void setDelayMessageHandler(DelayMessageHandler handler) {
+        this.delayMessageHandler = handler;
+    }
+
+    public void setTimerMessageHandler(TimerMessageHandler handler) {
+        this.timerMessageHandler = handler;
     }
 
     /**
@@ -153,6 +182,43 @@ public class CommitLogParser {
             try {
                 SyncRecord record = parseMessage(msgBytes, currentPhyOffset, masterPhyOffset);
                 if (record != null) {
+                    // === 特殊消息处理（需求 21）===
+
+                    // 1. 事务消息过滤（§21.8）
+                    if (transactionMessageFilter != null
+                            && transactionMessageFilter.shouldSkip(record.getTopic())) {
+                        continue; // 跳过事务 Half/Op 消息
+                    }
+
+                    // 2. 延迟消息处理（§21.4）
+                    if (delayMessageHandler != null
+                            && delayMessageHandler.isDelayMessage(record.getTopic())) {
+                        record = delayMessageHandler.transformDelayMessage(record);
+                        if (record == null) {
+                            // 解析失败 → 发送到 RFQ
+                            handleParseFailure(msgBytes, masterPhyOffset, positionInPacket,
+                                    totalSize, "DELAY_MSG_PARSE_ERROR");
+                            totalParseError++;
+                            continue;
+                        }
+                    }
+                    // 3. 定时消息处理（§21.5）— TimerWheel Topic
+                    else if (timerMessageHandler != null
+                            && timerMessageHandler.isTimerTopicMessage(record.getTopic())) {
+                        record = timerMessageHandler.transformTimerTopicMessage(record);
+                        if (record == null) {
+                            handleParseFailure(msgBytes, masterPhyOffset, positionInPacket,
+                                    totalSize, "TIMER_MSG_PARSE_ERROR");
+                            totalParseError++;
+                            continue;
+                        }
+                    }
+                    // 4. 定时消息处理（§21.5）— 普通 Topic 带 __STARTDELIVERTIME 属性
+                    else if (timerMessageHandler != null
+                            && timerMessageHandler.hasTimerProperty(record.getProperties())) {
+                        record = timerMessageHandler.markAsTimerMessage(record);
+                    }
+
                     records.add(record);
 
                     // 更新 Topic 流量统计

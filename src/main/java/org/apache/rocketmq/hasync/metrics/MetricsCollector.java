@@ -119,6 +119,53 @@ public class MetricsCollector {
     /** 当前生效的 Topic 过滤白名单（需求 20 §5：Sink 侧同时包含 activeTopicFilter） */
     private volatile String activeTopicFilter = "";
 
+    // ==================== 梯度重试与任务暂停指标（需求 21 §21.3） ====================
+
+    /** Sink 是否处于暂停状态 */
+    private volatile boolean sinkSuspended = false;
+
+    /** 梯度重试耗尽导致暂停的累计次数 */
+    private final AtomicLong sinkSuspendCount = new AtomicLong(0);
+
+    /** 当前暂停持续时长（秒） */
+    private volatile long sinkSuspendDurationSeconds = 0;
+
+    /** 梯度重试触发的累计次数 */
+    private final AtomicLong sinkGradientRetryCount = new AtomicLong(0);
+
+    /** 梯度重试成功恢复的累计次数 */
+    private final AtomicLong sinkGradientRetryRecoverCount = new AtomicLong(0);
+
+    /** 最近一次梯度重试所处的级别 */
+    private volatile int sinkLastRetryLevel = 0;
+
+    // ==================== 延迟消息同步指标（需求 21 §21.4） ====================
+
+    /** 已同步的延迟消息总数 */
+    private final AtomicLong delayMsgSyncCount = new AtomicLong(0);
+
+    /** 延迟消息解析失败的总数 */
+    private final AtomicLong delayMsgParseErrorCount = new AtomicLong(0);
+
+    /** 因 Topic 过滤跳过的延迟消息总数 */
+    private final AtomicLong delayMsgSkipCount = new AtomicLong(0);
+
+    // ==================== 定时消息同步指标（需求 21 §21.5） ====================
+
+    /** 已同步的定时消息总数 */
+    private final AtomicLong timerMsgSyncCount = new AtomicLong(0);
+
+    /** 已过期（立即投递）的定时消息总数 */
+    private final AtomicLong timerMsgExpiredCount = new AtomicLong(0);
+
+    /** 定时消息解析失败的总数 */
+    private final AtomicLong timerMsgParseErrorCount = new AtomicLong(0);
+
+    // ==================== 事务消息过滤指标（需求 21 §21.8） ====================
+
+    /** 因事务消息策略跳过的消息条数 */
+    private final AtomicLong transactionMsgSkipCount = new AtomicLong(0);
+
     // ==================== Pipeline 侧指标 ====================
 
     /** 每秒同步字节数 */
@@ -183,6 +230,19 @@ public class MetricsCollector {
     public void incrementTopicSyncOnDemandCount() { topicSyncOnDemandCount.incrementAndGet(); }
     public void incrementTopicSyncFailureCount() { topicSyncFailureCount.incrementAndGet(); }
 
+    // ==================== 需求 21 increment 方法 ====================
+
+    public void incrementSinkSuspendCount() { sinkSuspendCount.incrementAndGet(); }
+    public void incrementSinkGradientRetryCount() { sinkGradientRetryCount.incrementAndGet(); }
+    public void incrementSinkGradientRetryRecoverCount() { sinkGradientRetryRecoverCount.incrementAndGet(); }
+    public void incrementDelayMsgSyncCount() { delayMsgSyncCount.incrementAndGet(); }
+    public void incrementDelayMsgParseErrorCount() { delayMsgParseErrorCount.incrementAndGet(); }
+    public void incrementDelayMsgSkipCount() { delayMsgSkipCount.incrementAndGet(); }
+    public void incrementTimerMsgSyncCount() { timerMsgSyncCount.incrementAndGet(); }
+    public void incrementTimerMsgExpiredCount() { timerMsgExpiredCount.incrementAndGet(); }
+    public void incrementTimerMsgParseErrorCount() { timerMsgParseErrorCount.incrementAndGet(); }
+    public void incrementTransactionMsgSkipCount() { transactionMsgSkipCount.incrementAndGet(); }
+
     // ==================== Pipeline 侧 increment 方法 ====================
 
     public void incrementMetaSyncSuccessCount() { metaSyncSuccessCount.incrementAndGet(); }
@@ -204,6 +264,9 @@ public class MetricsCollector {
         this.topicSyncFailedTopic = suspended ? topic : "";
     }
     public void setActiveTopicFilter(String filter) { this.activeTopicFilter = filter; }
+    public void setSinkSuspended(boolean suspended) { this.sinkSuspended = suspended; }
+    public void setSinkSuspendDurationSeconds(long seconds) { this.sinkSuspendDurationSeconds = seconds; }
+    public void setSinkLastRetryLevel(int level) { this.sinkLastRetryLevel = level; }
     public void setSyncBytesPerSecond(long bytes) { this.syncBytesPerSecond = bytes; }
     public void setQueueSize(int size) { this.queueSize = size; }
     public void setConfirmedOffset(long offset) { this.confirmedOffset = offset; }
@@ -254,6 +317,19 @@ public class MetricsCollector {
     public boolean isTopicSyncSuspended() { return topicSyncSuspended; }
     public String getTopicSyncFailedTopic() { return topicSyncFailedTopic; }
     public String getActiveTopicFilter() { return activeTopicFilter; }
+    public boolean isSinkSuspended() { return sinkSuspended; }
+    public long getSinkSuspendCount() { return sinkSuspendCount.get(); }
+    public long getSinkSuspendDurationSeconds() { return sinkSuspendDurationSeconds; }
+    public long getSinkGradientRetryCount() { return sinkGradientRetryCount.get(); }
+    public long getSinkGradientRetryRecoverCount() { return sinkGradientRetryRecoverCount.get(); }
+    public int getSinkLastRetryLevel() { return sinkLastRetryLevel; }
+    public long getDelayMsgSyncCount() { return delayMsgSyncCount.get(); }
+    public long getDelayMsgParseErrorCount() { return delayMsgParseErrorCount.get(); }
+    public long getDelayMsgSkipCount() { return delayMsgSkipCount.get(); }
+    public long getTimerMsgSyncCount() { return timerMsgSyncCount.get(); }
+    public long getTimerMsgExpiredCount() { return timerMsgExpiredCount.get(); }
+    public long getTimerMsgParseErrorCount() { return timerMsgParseErrorCount.get(); }
+    public long getTransactionMsgSkipCount() { return transactionMsgSkipCount.get(); }
 
     public long getSyncBytesPerSecond() { return syncBytesPerSecond; }
     public int getQueueSize() { return queueSize; }
@@ -315,6 +391,23 @@ public class MetricsCollector {
         m.put("topicSyncSuspended", topicSyncSuspended);
         m.put("topicSyncFailedTopic", topicSyncFailedTopic);
         m.put("activeTopicFilter", activeTopicFilter);
+        // 需求 21 §21.3 梯度重试暂停指标
+        m.put("sinkSuspended", sinkSuspended);
+        m.put("sinkSuspendCount", sinkSuspendCount.get());
+        m.put("sinkSuspendDurationSeconds", sinkSuspendDurationSeconds);
+        m.put("sinkGradientRetryCount", sinkGradientRetryCount.get());
+        m.put("sinkGradientRetryRecoverCount", sinkGradientRetryRecoverCount.get());
+        m.put("sinkLastRetryLevel", sinkLastRetryLevel);
+        // 需求 21 §21.4 延迟消息指标
+        m.put("delayMsgSyncCount", delayMsgSyncCount.get());
+        m.put("delayMsgParseErrorCount", delayMsgParseErrorCount.get());
+        m.put("delayMsgSkipCount", delayMsgSkipCount.get());
+        // 需求 21 §21.5 定时消息指标
+        m.put("timerMsgSyncCount", timerMsgSyncCount.get());
+        m.put("timerMsgExpiredCount", timerMsgExpiredCount.get());
+        m.put("timerMsgParseErrorCount", timerMsgParseErrorCount.get());
+        // 需求 21 §21.8 事务消息指标
+        m.put("transactionMsgSkipCount", transactionMsgSkipCount.get());
         return m;
     }
 
@@ -386,6 +479,21 @@ public class MetricsCollector {
         topicSyncSuspended = false;
         topicSyncFailedTopic = "";
         activeTopicFilter = "";
+
+        // 需求 21 新增指标重置
+        sinkSuspended = false;
+        sinkSuspendCount.set(0);
+        sinkSuspendDurationSeconds = 0;
+        sinkGradientRetryCount.set(0);
+        sinkGradientRetryRecoverCount.set(0);
+        sinkLastRetryLevel = 0;
+        delayMsgSyncCount.set(0);
+        delayMsgParseErrorCount.set(0);
+        delayMsgSkipCount.set(0);
+        timerMsgSyncCount.set(0);
+        timerMsgExpiredCount.set(0);
+        timerMsgParseErrorCount.set(0);
+        transactionMsgSkipCount.set(0);
 
         syncBytesPerSecond = 0;
         queueSize = 0;

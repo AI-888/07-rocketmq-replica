@@ -8,6 +8,13 @@ import java.util.Map;
  * Source 与 Sink 之间传递的数据单元
  * <p>
  * Sink 必须严格按 {@link #physicOffset} 升序写入目标集群。
+ * <p>
+ * 消息类型通过 {@link #syncRecordType} 标识（需求 21 §21.4/§21.5）：
+ * <ul>
+ *   <li>NORMAL — 普通消息</li>
+ *   <li>DELAY_MESSAGE — 延迟消息（需要设置 delayTimeLevel）</li>
+ *   <li>TIMER_MESSAGE — 定时消息（需要设置 deliverTimeMs）</li>
+ * </ul>
  * 
  * @see org.apache.rocketmq.hasync.core.SyncSource
  * @see org.apache.rocketmq.hasync.core.SyncSink
@@ -72,8 +79,30 @@ public class SyncRecord implements Serializable {
     /** 重复消费次数 */
     private int reconsumeTimes;
 
+    /**
+     * 消息类型（需求 21 §21.4/§21.5）
+     * <p>
+     * 默认 NORMAL，延迟消息为 DELAY_MESSAGE，定时消息为 TIMER_MESSAGE
+     */
+    private SyncRecordType syncRecordType;
+
+    /**
+     * 延迟级别（仅 DELAY_MESSAGE 类型有效，需求 21 §21.4）
+     * <p>
+     * 对应 RocketMQ delayTimeLevel：1=1s, 2=5s, 3=10s, ...
+     */
+    private int delayTimeLevel;
+
+    /**
+     * 定时投递时间戳（仅 TIMER_MESSAGE 类型有效，需求 21 §21.5）
+     * <p>
+     * Unix 毫秒时间戳，对应 __STARTDELIVERTIME 属性
+     */
+    private long deliverTimeMs;
+
     public SyncRecord() {
         this.properties = new HashMap<>();
+        this.syncRecordType = SyncRecordType.NORMAL;
     }
 
     // ==================== Getters & Setters ====================
@@ -213,6 +242,30 @@ public class SyncRecord implements Serializable {
         this.reconsumeTimes = reconsumeTimes;
     }
 
+    public SyncRecordType getSyncRecordType() {
+        return syncRecordType;
+    }
+
+    public void setSyncRecordType(SyncRecordType syncRecordType) {
+        this.syncRecordType = syncRecordType;
+    }
+
+    public int getDelayTimeLevel() {
+        return delayTimeLevel;
+    }
+
+    public void setDelayTimeLevel(int delayTimeLevel) {
+        this.delayTimeLevel = delayTimeLevel;
+    }
+
+    public long getDeliverTimeMs() {
+        return deliverTimeMs;
+    }
+
+    public void setDeliverTimeMs(long deliverTimeMs) {
+        this.deliverTimeMs = deliverTimeMs;
+    }
+
     @Override
     public String toString() {
         return "SyncRecord{" +
@@ -223,6 +276,7 @@ public class SyncRecord implements Serializable {
                 ", queueId=" + queueId +
                 ", msgSize=" + msgSize +
                 ", traceId='" + traceId + '\'' +
+                ", syncRecordType=" + syncRecordType +
                 '}';
     }
 }
