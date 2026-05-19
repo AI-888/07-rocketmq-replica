@@ -1,9 +1,5 @@
 package org.apache.rocketmq.hasync.config;
 
-import org.apache.rocketmq.hasync.model.ConfigEntry;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.util.ArrayList;
@@ -13,6 +9,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
+import org.apache.rocketmq.hasync.model.ConfigEntry;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * 配置管理抽象基类 — 三层配置合并加载
@@ -21,15 +20,19 @@ import java.util.Set;
  * <p>
  * 对应需求 1（启动参数配置）
  *
- * @see org.apache.rocketmq.hasync.config.SourceConfig
- * @see org.apache.rocketmq.hasync.config.SinkConfig
+ * @see SourceConfig
+ * @see SinkConfig
  */
 public abstract class AbstractConfig {
 
     private static final Logger log = LoggerFactory.getLogger(AbstractConfig.class);
 
-    /** 最终生效的配置项 */
+    /**
+     * 最终生效的配置项
+     */
     protected final Map<String, ConfigEntry> configMap = new LinkedHashMap<>();
+    private String accessKey;
+    private String secretKey;
 
     /**
      * 三层配置合并加载
@@ -66,7 +69,10 @@ public abstract class AbstractConfig {
         // 5. 校验必填参数
         validateRequired();
 
-        // 6. 打印最终生效配置（敏感信息掩码 — 需求 1 §11）
+        // 6. 同步 AK/SK 到通用字段（供调用方通过 getter 使用）
+        syncCredentialFields();
+
+        // 7. 打印最终生效配置（敏感信息掩码 — 需求 1 §11）
         logFinalConfig();
 
         return configMap;
@@ -249,7 +255,7 @@ public abstract class AbstractConfig {
     /**
      * 获取配置项的整数值
      *
-     * @param key 配置项 key
+     * @param key          配置项 key
      * @param defaultValue 默认值
      * @return 整数值
      */
@@ -276,7 +282,7 @@ public abstract class AbstractConfig {
     /**
      * 获取配置项的长整数值
      *
-     * @param key 配置项 key
+     * @param key          配置项 key
      * @param defaultValue 默认值
      * @return 长整数值
      */
@@ -294,13 +300,30 @@ public abstract class AbstractConfig {
     }
 
     /**
+     * 将 accessKey/secretKey 从配置项同步到字段
+     */
+    private void syncCredentialFields() {
+        ConfigEntry ak = configMap.get("accessKey");
+        ConfigEntry sk = configMap.get("secretKey");
+        this.accessKey = ak != null ? ak.getValue() : null;
+        this.secretKey = sk != null ? sk.getValue() : null;
+    }
+
+    /**
      * 敏感信息掩码（需求 1 §11）
      * <p>
      * NameServer 地址 → 192.168.*.***:9876
      */
     public String maskSensitive(String key, String value) {
-        if (key.toLowerCase().contains("namesrv")) {
+        if (value == null) {
+            return null;
+        }
+        String lowerKey = key.toLowerCase();
+        if (lowerKey.contains("namesrv")) {
             return value.replaceAll("(\\d+\\.\\d+\\.)\\d+\\.\\d+", "$1*.***");
+        }
+        if (lowerKey.contains("accesskey") || lowerKey.contains("secretkey")) {
+            return "******";
         }
         return value;
     }
@@ -348,4 +371,20 @@ public abstract class AbstractConfig {
      * 打印使用说明
      */
     protected abstract void printUsage();
+
+    public String getAccessKey() {
+        return accessKey;
+    }
+
+    public void setAccessKey(String accessKey) {
+        this.accessKey = accessKey;
+    }
+
+    public String getSecretKey() {
+        return secretKey;
+    }
+
+    public void setSecretKey(String secretKey) {
+        this.secretKey = secretKey;
+    }
 }

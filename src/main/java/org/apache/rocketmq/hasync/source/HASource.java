@@ -113,7 +113,12 @@ public class HASource implements SyncSource {
         this.parser = new CommitLogParser();
         this.masterDiscovery = new MasterDiscovery(
                 config.getString("sourceNamesrv"),
-                config.getString("brokerName"));
+                config.getString("brokerName"),
+                new RocketMQMasterDiscoveryCallback(
+                        this.config.getSourceNamesrv(),
+                        this.config.getAccessKey(),
+                        this.config.getSecretKey()
+                ));
 
         String sourceNamesrv = config.getString("sourceNamesrv");
         String zmqHost = getLocalHost();

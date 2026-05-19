@@ -40,6 +40,8 @@ public class SinkConfig extends AbstractConfig {
     public static final String CONFIG_FILE = "configFile";
     public static final String SINK_GRADIENT_MAX_RETRY = "sinkGradientMaxRetry";
     public static final String SINK_GRADIENT_RETRY_DELAYS = "sinkGradientRetryDelays";
+    public static final String ACCESS_KEY = "accessKey";
+    public static final String SECRET_KEY = "secretKey";
 
     /** 所有配置项 key（有序） */
     private static final Set<String> ALL_KEYS = new LinkedHashSet<>();
@@ -65,6 +67,8 @@ public class SinkConfig extends AbstractConfig {
         ALL_KEYS.add(CONFIG_FILE);
         ALL_KEYS.add(SINK_GRADIENT_MAX_RETRY);
         ALL_KEYS.add(SINK_GRADIENT_RETRY_DELAYS);
+        ALL_KEYS.add(ACCESS_KEY);
+        ALL_KEYS.add(SECRET_KEY);
 
         // 必填参数（需求 1 §3：仅 targetNamesrv 必填）
         // sourceNamesrv 在独立 Sink 模式下需要，但内嵌模式由 SourceBootstrap 自动注入，故不强制必填
@@ -191,6 +195,8 @@ public class SinkConfig extends AbstractConfig {
         System.err.println("  --sinkGradientMaxRetry <n>            梯度重试最大次数（默认: 5）（需求 21 §21.3）");
         System.err.println("  --sinkGradientRetryDelays <delays>    各级重试等待时间，逗号分隔秒数（默认: 1,3,10,30,60）");
         System.err.println("  --configFile <path>                   配置文件路径（默认: ./ha-sync-sink.properties）");
+        System.err.println("  --accessKey <ak>                      ACL 访问凭证 AccessKey（可选）");
+        System.err.println("  --secretKey <sk>                      ACL 访问凭证 SecretKey（可选）");
     }
 
     // ==================== 工具方法 ====================

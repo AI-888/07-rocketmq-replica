@@ -1,11 +1,10 @@
 package org.apache.rocketmq.hasync.source;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import java.util.HashMap;
+import com.alibaba.fastjson2.JSON;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * NameServer Master 地址发现
@@ -21,31 +20,49 @@ public class MasterDiscovery {
 
     private static final Logger log = LoggerFactory.getLogger(MasterDiscovery.class);
 
-    /** 初始重试间隔（毫秒） */
+    /**
+     * 初始重试间隔（毫秒）
+     */
     private static final long INITIAL_RETRY_INTERVAL = 1000;
 
-    /** 最大重试间隔（毫秒） */
+    /**
+     * 最大重试间隔（毫秒）
+     */
     private static final long MAX_RETRY_INTERVAL = 30000;
 
-    /** NameServer 地址（多个以 ; 分隔） */
+    /**
+     * NameServer 地址（多个以 ; 分隔）
+     */
     private final String namesrvAddr;
 
-    /** Broker 名称（用于筛选特定 Broker 组） */
+    /**
+     * Broker 名称（用于筛选特定 Broker 组）
+     */
     private final String brokerName;
 
-    /** NameServer 查询失败计数 */
+    /**
+     * NameServer 查询失败计数
+     */
     private final AtomicInteger nameSrvQueryErrorCount = new AtomicInteger(0);
 
-    /** 当前已知的 Master HA 地址 */
+    /**
+     * 当前已知的 Master HA 地址
+     */
     private volatile String currentMasterHaAddr;
 
-    /** 当前已知的 Master Broker 地址（用于 Admin API） */
+    /**
+     * 当前已知的 Master Broker 地址（用于 Admin API）
+     */
     private volatile String currentMasterBrokerAddr;
 
-    /** Master 切换计数 */
+    /**
+     * Master 切换计数
+     */
     private final AtomicInteger masterSwitchCount = new AtomicInteger(0);
 
-    /** NameServer 客户端实例（延迟注入） */
+    /**
+     * NameServer 客户端实例（延迟注入）
+     */
     private MasterDiscoveryCallback callback;
 
     /**
@@ -58,10 +75,9 @@ public class MasterDiscovery {
         /**
          * 查询集群中的 Broker 信息
          *
-         * @param namesrvAddr NameServer 地址
          * @return 集群信息映射：brokerName → {brokerId → brokerAddr}
          */
-        Map<String, Map<Long, String>> getBrokerClusterInfo(String namesrvAddr) throws Exception;
+        Map<String, Map<Long, String>> getBrokerClusterInfo() throws Exception;
 
         /**
          * 获取指定 Broker 的 HA 服务地址
@@ -167,7 +183,7 @@ public class MasterDiscovery {
         }
 
         // 1. 查询集群 Broker 信息
-        Map<String, Map<Long, String>> clusterInfo = callback.getBrokerClusterInfo(namesrvAddr);
+        Map<String, Map<Long, String>> clusterInfo = callback.getBrokerClusterInfo();
 
         if (clusterInfo == null || clusterInfo.isEmpty()) {
             throw new RuntimeException("集群信息为空");
@@ -178,6 +194,7 @@ public class MasterDiscovery {
         if (brokerName != null && !brokerName.isEmpty()) {
             brokerAddrs = clusterInfo.get(brokerName);
             if (brokerAddrs == null) {
+                log.error("未找到 Broker 组: {}, cluster: {}", brokerName, JSON.toJSONString(clusterInfo));
                 throw new RuntimeException("未找到 Broker 组: " + brokerName);
             }
         } else {
@@ -188,6 +205,7 @@ public class MasterDiscovery {
         // 3. 选择 brokerId=0（Master）
         String masterAddr = brokerAddrs.get(0L);
         if (masterAddr == null) {
+            log.error("未找到 Broker 组: {}, cluster: {}", brokerName, JSON.toJSONString(clusterInfo));
             throw new RuntimeException("Broker 组中未找到 brokerId=0 的 Master 节点");
         }
 

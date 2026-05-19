@@ -127,7 +127,7 @@ public class MasterDiscoveryTest {
         void setFailCount(int count) { this.failCount = count; }
 
         @Override
-        public Map<String, Map<Long, String>> getBrokerClusterInfo(String namesrvAddr) throws Exception {
+        public Map<String, Map<Long, String>> getBrokerClusterInfo() throws Exception {
             callCount++;
             if (failAll || callCount <= failCount) {
                 throw new RuntimeException("模拟 NameServer 查询失败 #" + callCount);

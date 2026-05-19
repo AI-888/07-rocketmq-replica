@@ -44,6 +44,8 @@ public class SourceConfig extends AbstractConfig {
     public static final String CONFIG_FILE = "configFile";
     public static final String BROKER_NAME = "brokerName";
     public static final String WITH_SINK = "withSink";
+    public static final String ACCESS_KEY = "accessKey";
+    public static final String SECRET_KEY = "secretKey";
 
     /** 所有配置项 key（有序） */
     private static final Set<String> ALL_KEYS = new LinkedHashSet<>();
@@ -73,6 +75,8 @@ public class SourceConfig extends AbstractConfig {
         ALL_KEYS.add(CONFIG_FILE);
         ALL_KEYS.add(BROKER_NAME);
         ALL_KEYS.add(WITH_SINK);
+        ALL_KEYS.add(ACCESS_KEY);
+        ALL_KEYS.add(SECRET_KEY);
 
         // 必填参数（需求 1 §1）
         REQUIRED_KEYS.add(SOURCE_NAMESRV);
@@ -219,6 +223,8 @@ public class SourceConfig extends AbstractConfig {
         System.err.println("  --parseErrorSuspendWindowMs <ms>      解析错误暂停窗口（默认: 60000）");
         System.err.println("  --metaSyncInterval <ms>               元数据同步间隔（默认: 60000）");
         System.err.println("  --configFile <path>                   配置文件路径（默认: ./ha-sync-source.properties）");
+        System.err.println("  --accessKey <ak>                      ACL 访问凭证 AccessKey（可选）");
+        System.err.println("  --secretKey <sk>                      ACL 访问凭证 SecretKey（可选）");
         System.err.println("  --withSink <true|false>               是否同进程内嵌 Sink（默认: false）");
         System.err.println("                                        指定后 Sink 通过 localhost ZMQ 连接 Source，通信逻辑与独立部署一致");
     }
