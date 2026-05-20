@@ -5,6 +5,7 @@ import org.apache.rocketmq.hasync.config.SinkConfig;
 import org.apache.rocketmq.hasync.config.SourceConfig;
 import org.apache.rocketmq.hasync.core.SyncPipeline;
 import org.apache.rocketmq.hasync.metrics.MetricsCollector;
+import org.apache.rocketmq.hasync.metrics.MetricsHttpServer;
 import org.apache.rocketmq.hasync.sink.RocketMQSink;
 import org.apache.rocketmq.hasync.sink.SinkRetryPolicy;
 import org.apache.rocketmq.hasync.sink.SourceDiscovery;
@@ -78,7 +79,22 @@ public class SourceBootstrap {
             System.exit(1);
         }
 
-        // 4. 如果指定 --with-sink，在同进程内嵌启动 Sink
+        // 4. 启动 Source Metrics HTTP 服务（/metrics, /health, /resume）
+        MetricsHttpServer metricsHttpServer = new MetricsHttpServer(
+                metricsCollector,
+                config.getSourceMetricsPort(),
+                "source");
+        metricsHttpServer.setResumeCallback(haSource::resume);
+        try {
+            metricsHttpServer.start();
+            log.info("Source Metrics HTTP 服务已启动: http://localhost:{}/metrics", config.getSourceMetricsPort());
+        } catch (Exception e) {
+            log.error("Source Metrics HTTP 服务启动失败，进程退出", e);
+            haSource.stop();
+            System.exit(1);
+        }
+
+        // 5. 如果指定 --with-sink，在同进程内嵌启动 Sink
         RocketMQSink embeddedSink = null;
         if (config.isWithSink()) {
             log.info("=== --with-sink 已启用，同进程内嵌启动 Sink ===");
@@ -117,9 +133,10 @@ public class SourceBootstrap {
             }
         }
 
-        // 5. 注册 ShutdownHook
+        // 6. 注册 ShutdownHook
         final HASource sourceRef = haSource;
         final RocketMQSink sinkRef = embeddedSink;
+        final MetricsHttpServer metricsRef = metricsHttpServer;
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             log.info("收到停机信号，开始优雅退出...");
 
@@ -131,6 +148,12 @@ public class SourceBootstrap {
                 } catch (Exception e) {
                     log.error("内嵌 Sink 停止异常", e);
                 }
+            }
+
+            try {
+                metricsRef.stop();
+            } catch (Exception e) {
+                log.error("Metrics HTTP 服务停止异常", e);
             }
 
             sourceRef.stop();
